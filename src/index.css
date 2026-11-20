@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Lora", Georgia, serif;
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-pup-maroon: #7b1113;
+  --color-pup-maroon-dark: #580b0d;
+  --color-pup-gold: #e5a91a;
+  --color-pup-cream: #f5f2eb;
+  --color-pup-ink: #141112;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  background-color: #120e0f;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom subtle scrollbars for dialogue & assistant drawers */
+.campus-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.campus-scroll::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.03);
+}
+.campus-scroll::-webkit-scrollbar-thumb {
+  background: rgba(229, 169, 26, 0.35);
+  border-radius: 3px;
+}
+.campus-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(229, 169, 26, 0.55);
+}

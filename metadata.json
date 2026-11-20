@@ -1,0 +1,6 @@
+{
+  "name": "PUP Sta. Mesa 3D — Campus Simulation",
+  "description": "Interactive 3D simulation of the Polytechnic University of the Philippines (PUP) Main Campus in Sta. Mesa, Manila with explorable landmarks, living NPCs, and AI-powered conversations.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
