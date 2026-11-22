@@ -33,6 +33,9 @@ const INITIAL_HUD: SimulationHudSnapshot = {
   prompt: null,
   npcs: [],
   activeWaypointId: null,
+  showColliders: false,
+  colliderCount: 0,
+  blockedByColliderIds: [],
 };
 
 export default function App() {
@@ -175,6 +178,11 @@ export default function App() {
     setSettings((prev) => ({ ...prev, perspective: next }));
   }, [settings.perspective]);
 
+  const toggleShowColliders = useCallback(() => {
+    simRef.current?.playAeroUiClick();
+    simRef.current?.toggleShowColliders();
+  }, []);
+
   const cycleTimeOfDay = useCallback(() => {
     const idx = TIME_ORDER.indexOf(settings.timeOfDay);
     const next = TIME_ORDER[(idx + 1) % TIME_ORDER.length];
@@ -231,6 +239,9 @@ export default function App() {
         } else if (e.code === 'KeyM') {
           e.preventDefault();
           setAssistantOpen('map');
+        } else if (e.code === 'KeyH') {
+          e.preventDefault();
+          toggleShowColliders();
         }
       }
     };
@@ -246,6 +257,7 @@ export default function App() {
     hasModalOverlay,
     startSimulation,
     togglePerspective,
+    toggleShowColliders,
   ]);
 
   return (
@@ -312,6 +324,7 @@ export default function App() {
             }}
             onTriggerInteract={() => simRef.current?.triggerInteract()}
             onClearWaypoint={() => simRef.current?.setWaypoint(null)}
+            onToggleShowColliders={toggleShowColliders}
           />
         </>
       )}

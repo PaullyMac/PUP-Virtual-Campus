@@ -1,3 +1,12 @@
+import {
+  CAMPUS_XZ_SCALE,
+  scaleWorldBounds,
+  scaleWorldPoint,
+  scaleWorldX,
+  scaleWorldY,
+  scaleWorldZ,
+} from './worldScale';
+
 export type VerificationStatus = 'verified' | 'approximated';
 
 export interface Vec2 {
@@ -13,6 +22,12 @@ export interface AABB {
   maxZ: number;
   minY?: number;
   maxY?: number;
+  /** Optional oriented bounding box (OBB) fields for rotated walls/buildings (Three.js rotation.y) */
+  cx?: number;
+  cz?: number;
+  halfW?: number;
+  halfD?: number;
+  rotY?: number;
 }
 
 export interface CampusLandmark {
@@ -93,22 +108,22 @@ export interface InspectableItem {
 export type TimeOfDayPreset = 'morning' | 'midday' | 'golden' | 'dusk' | 'night';
 export type WeatherPreset = 'clear' | 'overcast' | 'rain';
 
-export const CAMPUS_BOUNDS = {
-  minX: -78,
+export const CAMPUS_BOUNDS = scaleWorldBounds({
+  minX: -74,
   maxX: 215,
-  minZ: -76,
-  maxZ: 120,
-};
+  minZ: -74,
+  maxZ: 235,
+});
 
 export const PLAYER_SPAWN = {
-  x: 94.2,
+  x: scaleWorldX(94.2),
   y: 0,
-  z: -5.2,
+  z: scaleWorldZ(-5.2),
   // Facing West (-X) across Anonas St directly toward the iconic PUP Main Gate, towering P-U-P Pylon, Brass Mural & Obelisk avenue
   yaw: Math.PI / 2,
 };
 
-export const CAMPUS_LANDMARKS: CampusLandmark[] = [
+const RAW_CAMPUS_LANDMARKS: CampusLandmark[] = [
   {
     id: 'main-gate',
     name: 'Main Gate, PUP Pylon & The Mural',
@@ -135,7 +150,7 @@ export const CAMPUS_LANDMARKS: CampusLandmark[] = [
       'Sculptural relief artwork on the Mural rendered via layered 3D bronze geometry and procedural relief texture',
       'Anonas Street exterior apron connects directly east across the PNR/NLEX Connector into the full Teresa Street corridor',
     ],
-    connectedTo: ['catwalk', 'obelisk-freedom-park', 'mabini-shrine', 'pnr-stamesa', 'maui-el-pueblo'],
+    connectedTo: ['catwalk', 'obelisk-freedom-park', 'mabini-shrine', 'pnr-stamesa', 'barangay-630-hall'],
     mapColor: '#e5a91a',
   },
   {
@@ -455,21 +470,22 @@ export const CAMPUS_LANDMARKS: CampusLandmark[] = [
     category: 'park',
     gps: { lat: 14.596103, lng: 121.010835 },
     position: { x: -67, z: 12 },
-    approachPoint: { x: -65, z: 12 },
+    approachPoint: { x: -68.5, z: 12 },
     approachYaw: Math.PI / 2,
     triggerRadius: 20,
     enterable: false,
     summary:
-      'The scenic riverside walkway stretching along the entire western edge of PUP Sta. Mesa beside the shimmering Pasig River and leading down to the PUP Pasig River Ferry Station.',
+      'The scenic riverside walkway stretching along the entire western edge of PUP Sta. Mesa directly overlooking the sunken, flowing Pasig River (Ilog Pasig), cruising MMDA ferries, water hyacinths, Pandacan opposite riverbank, and leading down to the PUP Pasig River Ferry Station.',
     architecturalNotes:
-      'Continuous paved riverfront promenade lined with concrete balustrades, tropical trees, shaded benches, animated Pasig River water reflections, and the maroon-roofed PUP Ferry Station pier at the southwestern corner.',
+      'Continuous paved riverfront promenade lined with open forest-green steel railings above the vertical concrete river seawall dropping down to the Pasig River, tropical palms, shaded benches, animated Pasig River water reflections and cruising MMDA ferry catamaran, Mabini Bridge on the northern horizon, and the maroon-roofed PUP Ferry Station pontoon dock at the southwestern corner.',
     verificationStatus: 'verified',
     verifiedFeatures: [
-      'Western riverfront promenade running beside the Pasig River from the Lab High School block down to the PUP Ferry Station',
-      'Concrete riverside seawall, balustrades, benches, and ferry terminal pier',
+      'Western riverfront promenade with open green steel railings directly overlooking the sunken Pasig River (Ilog Pasig) channel',
+      'Concrete riverside embankment seawall, moored floating ferry pontoon with boarding gangway, drifting water hyacinths, and cruising MMDA river ferry',
+      'Pandacan opposite riverbank skyline & Mabini (Nagtahan) Bridge visible across the river',
     ],
     approximatedFeatures: [
-      'Across-the-river Manila urban silhouettes are atmospheric horizon approximations',
+      'Across-the-river Pandacan urban facades and distant Mabini Bridge span are architectural horizon models',
     ],
     connectedTo: ['nallrc', 'charlie-del-rosario', 'main-building', 'pup-ferry-station'],
     mapColor: '#3a7ca5',
@@ -481,8 +497,8 @@ export const CAMPUS_LANDMARKS: CampusLandmark[] = [
     category: 'landmark',
     gps: { lat: 14.59605, lng: 121.01085 },
     position: { x: -75, z: 56 },
-    approachPoint: { x: -64, z: 42 },
-    approachYaw: Math.PI * 0.78,
+    approachPoint: { x: -72.6, z: 45.2 },
+    approachYaw: Math.PI - 0.34,
     triggerRadius: 15,
     enterable: false,
     summary:
@@ -694,8 +710,8 @@ export const CAMPUS_LANDMARKS: CampusLandmark[] = [
     shortName: 'Tahanan ng Atleta',
     category: 'sports',
     gps: { lat: 14.59735, lng: 121.01212 },
-    position: { x: 26, z: 67.5 },
-    approachPoint: { x: 26, z: 53.0 },
+    position: { x: 27.5, z: 68.8 },
+    approachPoint: { x: 27.5, z: 58.0 },
     approachYaw: Math.PI,
     triggerRadius: 15,
     enterable: false,
@@ -712,7 +728,7 @@ export const CAMPUS_LANDMARKS: CampusLandmark[] = [
     approximatedFeatures: [
       'Exterior architectural model overlooking the Oval running track',
     ],
-    connectedTo: ['oval-grandstand', 'food-nutrition-strip', 'maui-el-pueblo'],
+    connectedTo: ['oval-grandstand', 'food-nutrition-strip', 'barangay-630-hall'],
     mapColor: '#8f2426',
   },
   {
@@ -742,35 +758,69 @@ export const CAMPUS_LANDMARKS: CampusLandmark[] = [
     mapColor: '#5c6b78',
   },
   {
-    id: 'maui-el-pueblo',
-    name: 'South Anonas, Barangay 630 Hall, Maui Oasis, Futura Centro & El Pueblo',
-    shortName: 'Brgy. 630 · Maui Oasis & El Pueblo',
+    id: 'barangay-630-hall',
+    name: 'Barangay 630 Zone 63 Hall & South Anonas Street',
+    shortName: 'Barangay 630 · Anonas St.',
     category: 'student-life',
-    gps: { lat: 14.59735, lng: 121.01275 },
-    position: { x: 76, z: 92 },
-    approachPoint: { x: 89.2, z: 57.8 },
-    approachYaw: Math.PI - 0.14,
+    gps: { lat: 14.59748, lng: 121.01242 },
+    position: { x: 96, z: 96 },
+    approachPoint: { x: 90.0, z: 73.5 },
+    approachYaw: Math.PI - 0.08,
     triggerRadius: 26,
     enterable: false,
     summary:
-      'The bustling 630 Anonas Street corridor running past PUP’s ribbed Oval perimeter wall, Alfamart Anonas, the two-story royal-blue & yellow Barangay 630 Zone 63 Hall, Barangay Covered Court, and Anonas–PUP TODA tricycle terminal, curving southwest past Maui Oasis by Filinvest’s main archway & pool courtyard, roadside carinderias/water-refilling stalls, Futura Centro, El Pueblo Triangle, and El Pueblo Manila Condominium.',
+      'The lively Barangay 630 Zone 63 civic and residential corridor stretching far south along Anonas Street past PUP’s Oval perimeter wall—anchored by Anonas Student Dorm, Alfamart Anonas, the two-story royal-blue & yellow Barangay 630 Hall, Covered Court, Health Center & SK Annex, Kalye Eskinita alley arch, carinderias, water-refilling & laundry shops, vulcanizing bay, bakery, and boarding houses leading toward Maui Oasis and El Pueblo.',
     architecturalNotes:
-      'Photo-matched directly to 2026 Google Maps satellite imagery and street-level photography of 630 Anonas Street (Barangay 630, Zone 63, District VI, Manila): two-story royal-blue, yellow & white Barangay 630 Hall with Tanod outpost, flagpole & Patrol Multicab; adjacent covered basketball half-court; Alfamart convenience store; Anonas–PUP TODA waiting shed; Meralco poles with overhead cables, convex corner traffic mirror, pedestrian crosswalks, speed humps, fire hydrants & parked vehicles; Hawaiian stone-clad Maui Oasis main gatehouse & resort pool; South-East carinderia/water-refilling/vulcanizing shops; Futura Centro, El Pueblo Triangle, and El Pueblo Manila commercial gatehouse.',
+      'Modeled as a full-length Sta. Mesa neighborhood street extending ~200m south of PUP Oval Gate: East-side row (Student Dorm & Print Hub, Alfamart Anonas, Barangay 630 Zone 63 Hall with Tanod Outpost, Philippine flagpole & Patrol Multicab, Multi-Purpose Covered Court, Health Center & SK Annex, Kalye Eskinita alley arch, Kuya Boy Barbershop & Sari-Sari Store, 630 Bigasan & Mini-Grocery, Anonas Moto-Fix Vulcanizing, Sta. Mesa Panaderia & Milk Tea, and Anonas–PUP TODA Terminal) facing the West-side weathered compound wall, fishball/buko carts, Mama Nena’s Tapsilogan, Aqua-630 Water & Laundry, Sta. Mesa Iskolar Boarding House, and Anonas Hardware.',
     verificationStatus: 'verified',
     verifiedFeatures: [
-      'Two-story Barangay 630 Zone 63 Hall (630 Anonas St) with Tanod outpost, Philippine flagpole, Patrol Multicab, and adjacent Covered Multi-Purpose Court',
-      'Alfamart Anonas, Anonas–PUP TODA tricycle terminal, SE roadside water-refilling/laundry/carinderia/vulcanizing stalls, Meralco poles, crosswalks, speed humps & convex traffic mirror',
-      'PUP cream-and-maroon Oval perimeter wall (2281–2315 Anonas St), vine-draped wall with Hawaiian Maui Oasis Main Gatehouse & pool courtyard, Futura Centro, El Pueblo Triangle & El Pueblo Manila',
+      'Two-story Barangay 630 Zone 63 Hall with Tanod Outpost, Philippine flagpole, Patrol Multicab, Covered Multi-Purpose Court, and Health Center & SK Annex',
+      'Full extended South Anonas Street residential, dormitory, sari-sari, carinderia, bakery, vulcanizing & Kalye Eskinita alley block separating PUP from Maui Oasis',
+      'Continuous Manila blue-and-yellow curbstones, Meralco poles with overhead cables, speed humps, zebra crosswalks, fire hydrants & queued tricycles',
+    ],
+    approximatedFeatures: [
+      'Individual neighborhood shopfront interiors and private compound alleys are exterior architectural facades',
+    ],
+    connectedTo: ['main-gate', 'tahanan-ng-atleta', 'maui-el-pueblo'],
+    mapColor: '#1f62b5',
+  },
+  {
+    id: 'maui-el-pueblo',
+    name: 'Maui Oasis by Filinvest, Futura Centro & El Pueblo Manila',
+    shortName: 'Maui Oasis & El Pueblo',
+    category: 'student-life',
+    gps: { lat: 14.5967, lng: 121.0119 },
+    position: { x: 46, z: 186 },
+    approachPoint: { x: 72.1, z: 174.9 },
+    approachYaw: Math.PI / 2 + 0.24,
+    triggerRadius: 34,
+    enterable: false,
+    summary:
+      'Reached after walking the full length of South Anonas Street past Barangay 630 Hall and its student boarding-house strip (~300–400m from PUP Main Gate): the sweeping divided tree-lined condominium boulevard uniting Hawaiian-themed Maui Oasis by Filinvest, Futura Centro, El Pueblo Triangle, and El Pueblo Manila Condominium.',
+    architecturalNotes:
+      'Separated cleanly ~140m+ south of PUP’s Oval perimeter by the extended Barangay 630 residential & commercial corridor: wide curved Anonas junction with TODA terminal and triple-transformer Meralco pole opening onto a 180m divided tree-lined boulevard flanked by Maui Oasis’s moss-streaked vine wall, Hawaiian stone-clad Main Gatehouse, three mid-rise condo wings around a central resort pool, Futura Centro tower, SE commercial stalls, El Pueblo Triangle, and El Pueblo Manila’s arched gatehouse & twin terracotta residential towers.',
+    verificationStatus: 'verified',
+    verifiedFeatures: [
+      'True long walking distance (~300–400m) south of PUP Main Gate via the full Barangay 630 Anonas Street neighborhood',
+      'Hawaiian stone-clad Maui Oasis Main Gatehouse, vine-draped perimeter wall, three mid-rise wings & central resort swimming pool',
+      'Futura Centro by Filinvest, El Pueblo Triangle, and El Pueblo Manila Condominium with ground-floor commercial strip',
     ],
     approximatedFeatures: [
       'Condominium interiors and private resident driveways beyond the gatehouses are exterior architectural reconstructions',
     ],
-    connectedTo: ['main-gate', 'tahanan-ng-atleta'],
+    connectedTo: ['barangay-630-hall'],
     mapColor: '#b36b43',
   },
 ];
 
-export const CAMPUS_NPCS: NpcProfile[] = [
+export const CAMPUS_LANDMARKS: CampusLandmark[] = RAW_CAMPUS_LANDMARKS.map((lm) => ({
+  ...lm,
+  position: scaleWorldPoint(lm.position),
+  approachPoint: scaleWorldPoint(lm.approachPoint),
+  triggerRadius: Number((lm.triggerRadius * CAMPUS_XZ_SCALE).toFixed(2)),
+}));
+
+const RAW_CAMPUS_NPCS: NpcProfile[] = [
   {
     id: 'guard-jun',
     name: 'Kuya Jun Mendoza',
@@ -1133,7 +1183,18 @@ export const CAMPUS_NPCS: NpcProfile[] = [
   },
 ];
 
-export const INSPECTABLE_ITEMS: InspectableItem[] = [
+export const CAMPUS_NPCS: NpcProfile[] = RAW_CAMPUS_NPCS.map((npc) => ({
+  ...npc,
+  spawn: scaleWorldPoint(npc.spawn),
+  schedule: {
+    morning: { ...npc.schedule.morning, position: scaleWorldPoint(npc.schedule.morning.position) },
+    midday: { ...npc.schedule.midday, position: scaleWorldPoint(npc.schedule.midday.position) },
+    afternoon: { ...npc.schedule.afternoon, position: scaleWorldPoint(npc.schedule.afternoon.position) },
+    dusk: { ...npc.schedule.dusk, position: scaleWorldPoint(npc.schedule.dusk.position) },
+  },
+}));
+
+const RAW_INSPECTABLE_ITEMS: InspectableItem[] = [
   {
     id: 'sign-pylon-plaque',
     title: 'The PUP Pylon & Mural Marker',
@@ -1303,3 +1364,12 @@ export const INSPECTABLE_ITEMS: InspectableItem[] = [
     verificationNote: 'Modeled directly from May 2026 Instant Street View captures along Teresa Street and Old Sta. Mesa St.',
   },
 ];
+
+export const INSPECTABLE_ITEMS: InspectableItem[] = RAW_INSPECTABLE_ITEMS.map((item) => ({
+  ...item,
+  position: {
+    x: scaleWorldX(item.position.x),
+    y: scaleWorldY(item.position.y),
+    z: scaleWorldZ(item.position.z),
+  },
+}));

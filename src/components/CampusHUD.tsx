@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import {
+  Box,
   ChevronDown,
   ChevronUp,
   CloudRain,
@@ -23,6 +24,7 @@ import {
   WeatherPreset,
 } from '../campus/campusData';
 import { estimateRealWorldDistanceMeters } from '../campus/campusLogic';
+import { CAMPUS_XZ_SCALE, scaleWorldPoint, scaleWorldX } from '../campus/worldScale';
 import { CameraPerspective, SimulationHudSnapshot } from '../engine/CampusSimulation';
 
 interface CampusHUDProps {
@@ -45,6 +47,7 @@ interface CampusHUDProps {
   onOpenPause: () => void;
   onTriggerInteract: () => void;
   onClearWaypoint: () => void;
+  onToggleShowColliders: () => void;
 }
 
 const TIME_LABELS: Record<TimeOfDayPreset, string> = {
@@ -81,6 +84,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
   onOpenPause,
   onTriggerInteract,
   onClearWaypoint,
+  onToggleShowColliders,
 }) => {
   const [dockOpen, setDockOpen] = useState(() =>
     typeof window !== 'undefined' ? !(touchControls && window.innerWidth < 680) : true,
@@ -92,9 +96,12 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
     }
   }, [touchControls]);
 
-  // Convert world (x in [-84..224], z in [-76..122]) to SVG minimap coords (196 x 136)
-  const mapX = (x: number) => ((x + 84) / 308) * 188 + 4;
-  const mapY = (z: number) => ((z + 76) / 198) * 128 + 4;
+  // Convert blueprint (x in [-88..228], z in [-76..228]) to SVG minimap coords (196 x 154)
+  const mapX = (x: number) => ((x + 88) / 316) * 188 + 4;
+  const mapY = (z: number) => ((z + 76) / 304) * 146 + 4;
+  // Convert true 1:1 meter world coordinates back into blueprint minimap coordinates
+  const worldMapX = (wx: number) => mapX(wx / CAMPUS_XZ_SCALE);
+  const worldMapY = (wz: number) => mapY(wz / CAMPUS_XZ_SCALE);
 
   const activeWaypoint = hud.activeWaypointId
     ? CAMPUS_LANDMARKS.find((l) => l.id === hud.activeWaypointId) ?? null
@@ -106,8 +113,8 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
       )
     : null;
   const distFromGateM =
-    hud.playerX > 95
-      ? estimateRealWorldDistanceMeters({ x: 81.2, z: -4 }, { x: hud.playerX, z: hud.playerZ })
+    hud.playerX > scaleWorldX(95)
+      ? estimateRealWorldDistanceMeters(scaleWorldPoint({ x: 81.2, z: -4 }), { x: hud.playerX, z: hud.playerZ })
       : null;
 
   // Player heading degrees for SVG arrow (yaw = 0 faces -Z / North / Up on map)
@@ -144,6 +151,44 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
             </div>
           )}
         </div>
+
+        {/* Compact Hit-Box Verification Legend (visible ONLY when user activates Hit-Box Mode [H]) */}
+        {hud.showColliders && (
+          <div className="mt-2 rounded-lg bg-[#161112]/92 border border-emerald-400/45 px-3 py-2 shadow-lg text-[11px] text-[#e8dfcf]">
+            <div className="flex items-center justify-between gap-2 font-semibold text-emerald-300">
+              <span className="inline-flex items-center gap-1.5">
+                <Box className="w-3.5 h-3.5" />
+                Hit-Box Visualizer
+              </span>
+              <span className="font-mono-tabular text-[10px] text-[#cfc4b2]">
+                {hud.colliderCount} solid
+              </span>
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-2.5 text-[10px] text-[#cfc4b2]">
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block w-2 h-2 rounded-xs bg-emerald-400" />
+                AABB
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block w-2 h-2 rounded-xs bg-amber-400" />
+                OBB
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block w-2 h-2 rounded-xs bg-sky-400" />
+                Player
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-block w-2 h-2 rounded-xs bg-red-500" />
+                Contact
+              </span>
+            </div>
+            {hud.blockedByColliderIds.length > 0 && (
+              <div className="mt-1.5 pt-1.5 border-t border-white/10 font-mono-tabular text-[10px] text-red-300 truncate">
+                Blocked: {hud.blockedByColliderIds.join(', ')}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* TOP-CENTER: Contextual Landmark Discovery Banner */}
@@ -249,9 +294,10 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
           aria-label="Open full PUP Sta. Mesa Campus Map"
           className="hidden sm:block rounded-lg bg-[#151011]/92 border border-white/15 p-1.5 shadow-lg hover:border-[#e5a91a]/60 transition-colors cursor-pointer"
         >
-          <svg width="196" height="136" viewBox="0 0 196 136" className="block rounded bg-[#1d251d]">
-            {/* Pasig River strip on West */}
-            <rect x="0" y="0" width="11" height="136" fill="#20586d" />
+          <svg width="196" height="154" viewBox="0 0 196 154" className="block rounded bg-[#1d251d]">
+            {/* Pasig River (Ilog Pasig) wide flowing channel on West */}
+            <rect x="0" y="0" width="16" height="154" fill="#1e647a" />
+            <line x1="16" y1="0" x2="16" y2="154" stroke="#6aaec2" strokeWidth="0.9" opacity="0.65" />
 
             {/* PUP Lagoon water pocket */}
             <ellipse cx={mapX(-19)} cy={mapY(-17)} rx="6" ry="4.5" fill="#2a7b78" opacity="0.9" />
@@ -294,26 +340,30 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
               <rect x={mapX(-50.5)} y={mapY(62.5)} width={mapX(-32.5) - mapX(-50.5)} height={mapY(72.5) - mapY(62.5)} rx="1" />
               <rect x={mapX(-29)} y={mapY(62.5)} width={mapX(-4) - mapX(-29)} height={mapY(72.5) - mapY(62.5)} rx="1" />
               <rect x={mapX(-0.5)} y={mapY(62.5)} width={mapX(14.5) - mapX(-0.5)} height={mapY(72.5) - mapY(62.5)} rx="1" />
-              <rect x={mapX(18.5)} y={mapY(62.5)} width={mapX(33.5) - mapX(18.5)} height={mapY(72.5) - mapY(62.5)} rx="1" fill="#8f2426" />
+              <rect x={mapX(20.0)} y={mapY(63.8)} width={mapX(35.0) - mapX(20.0)} height={mapY(73.8) - mapY(63.8)} rx="1" fill="#8f2426" />
               {/* Teresa Street North & South shophouse strips (x=118..200) */}
               <rect x={mapX(118)} y={mapY(-18)} width={mapX(200) - mapX(118)} height={mapY(-10.5) - mapY(-18)} rx="1" fill="#c98e3a" />
               <rect x={mapX(136)} y={mapY(2.6)} width={mapX(200) - mapX(136)} height={mapY(10) - mapY(2.6)} rx="1" fill="#b87742" />
               <rect x={mapX(217)} y={mapY(-26)} width={mapX(224) - mapX(217)} height={mapY(18) - mapY(-26)} rx="1" fill="#9b4b38" />
-              {/* South Anonas Condos: Maui Oasis, Futura Centro & El Pueblo */}
-              <rect x={mapX(46)} y={mapY(81)} width={mapX(70) - mapX(46)} height={mapY(93) - mapY(81)} rx="1" fill="#c7a57c" />
-              <rect x={mapX(93)} y={mapY(92)} width={mapX(113) - mapX(93)} height={mapY(112) - mapY(92)} rx="1" fill="#9fb0c2" />
-              <rect x={mapX(20)} y={mapY(108)} width={mapX(44) - mapX(20)} height={mapY(120) - mapY(108)} rx="1" fill="#c47353" />
+              {/* Barangay 630 Civic & Commercial Strip along South Anonas St (z = 74..162) */}
+              <rect x={mapX(97)} y={mapY(72)} width={mapX(106) - mapX(97)} height={mapY(102) - mapY(72)} rx="1" fill="#2463c2" />
+              <rect x={mapX(97)} y={mapY(108)} width={mapX(105) - mapX(97)} height={mapY(161) - mapY(108)} rx="1" fill="#b8844c" />
+              <rect x={mapX(75)} y={mapY(119)} width={mapX(83) - mapX(75)} height={mapY(164) - mapY(119)} rx="1" fill="#a86d42" />
+              {/* Far-South Condo District (~140m+ south of PUP Oval): Maui Oasis, Futura Centro & El Pueblo */}
+              <rect x={mapX(14)} y={mapY(154)} width={mapX(66) - mapX(14)} height={mapY(170) - mapY(154)} rx="1" fill="#c7a57c" />
+              <rect x={mapX(100)} y={mapY(177)} width={mapX(120) - mapX(100)} height={mapY(197) - mapY(177)} rx="1" fill="#9fb0c2" />
+              <rect x={mapX(-22)} y={mapY(196)} width={mapX(4) - mapX(-22)} height={mapY(212) - mapY(196)} rx="1" fill="#c47353" />
             </g>
 
-            {/* Roads & Rail Corridors: Anonas St (89.5 -> SW to El Pueblo), PNR/NLEX (105.5), Teresa St -> Old Sta. Mesa St (208) */}
+            {/* Roads & Rail Corridors: Extended Anonas St (90.6 -> z=174 -> SW Blvd to El Pueblo), PNR/NLEX, Teresa St */}
             <path
-              d={`M ${mapX(89.5)} ${mapY(-70)} L ${mapX(89.5)} ${mapY(84)} Q ${mapX(89.5)} ${mapY(95)} ${mapX(76)} ${mapY(99)} L ${mapX(42)} ${mapY(106)}`}
+              d={`M ${mapX(90.6)} ${mapY(-70)} L ${mapX(90.6)} ${mapY(170)} Q ${mapX(90.6)} ${mapY(179)} ${mapX(76)} ${mapY(181)} L ${mapX(4)} ${mapY(198)}`}
               fill="none"
               stroke="#6d6a64"
               strokeWidth="2.8"
             />
-            <line x1={mapX(102)} y1={mapY(-70)} x2={mapX(102)} y2={mapY(88)} stroke="#d95d24" strokeWidth="1.4" strokeDasharray="3 2" />
-            <line x1={mapX(109.5)} y1={mapY(-70)} x2={mapX(109.5)} y2={mapY(88)} stroke="#a6a49d" strokeWidth="2.2" opacity="0.85" />
+            <line x1={mapX(102)} y1={mapY(-70)} x2={mapX(102)} y2={mapY(68)} stroke="#d95d24" strokeWidth="1.4" strokeDasharray="3 2" />
+            <line x1={mapX(109.5)} y1={mapY(-70)} x2={mapX(109.5)} y2={mapY(68)} stroke="#a6a49d" strokeWidth="2.2" opacity="0.85" />
             <line x1={mapX(208)} y1={mapY(-70)} x2={mapX(208)} y2={mapY(74)} stroke="#7c7870" strokeWidth="3.2" />
             <line x1={mapX(208)} y1={mapY(-4)} x2={mapX(14)} y2={mapY(-4)} stroke="#8b7f70" strokeWidth="2.8" />
             <circle cx={mapX(14)} cy={mapY(-4)} r="4.2" fill="#3a5e36" stroke="#c2b8a8" strokeWidth="1" />
@@ -325,8 +375,8 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
             {CAMPUS_LANDMARKS.map((lm) => (
               <circle
                 key={lm.id}
-                cx={mapX(lm.position.x)}
-                cy={mapY(lm.position.z)}
+                cx={worldMapX(lm.position.x)}
+                cy={worldMapY(lm.position.z)}
                 r={lm.id === 'main-building' ? 4 : 2.7}
                 fill={lm.mapColor}
                 stroke="#120e0f"
@@ -338,17 +388,17 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
             {activeWaypoint && (
               <>
                 <line
-                  x1={mapX(hud.playerX)}
-                  y1={mapY(hud.playerZ)}
-                  x2={mapX(activeWaypoint.approachPoint.x)}
-                  y2={mapY(activeWaypoint.approachPoint.z)}
+                  x1={worldMapX(hud.playerX)}
+                  y1={worldMapY(hud.playerZ)}
+                  x2={worldMapX(activeWaypoint.approachPoint.x)}
+                  y2={worldMapY(activeWaypoint.approachPoint.z)}
                   stroke="#e5a91a"
                   strokeWidth="1.5"
                   strokeDasharray="3 2"
                 />
                 <circle
-                  cx={mapX(activeWaypoint.approachPoint.x)}
-                  cy={mapY(activeWaypoint.approachPoint.z)}
+                  cx={worldMapX(activeWaypoint.approachPoint.x)}
+                  cy={worldMapY(activeWaypoint.approachPoint.z)}
                   r="4.8"
                   fill="none"
                   stroke="#e5a91a"
@@ -361,8 +411,8 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
             {hud.npcs.map((n) => (
               <circle
                 key={n.id}
-                cx={mapX(n.x)}
-                cy={mapY(n.z)}
+                cx={worldMapX(n.x)}
+                cy={worldMapY(n.z)}
                 r="1.7"
                 fill="#ffffff"
                 opacity="0.85"
@@ -371,7 +421,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
 
             {/* Player Arrow */}
             <g
-              transform={`translate(${mapX(hud.playerX)}, ${mapY(hud.playerZ)}) rotate(${headingDeg})`}
+              transform={`translate(${worldMapX(hud.playerX)}, ${worldMapY(hud.playerZ)}) rotate(${headingDeg})`}
             >
               <polygon points="0,-5.5 3.8,4 0,2 -3.8,4" fill="#e5a91a" stroke="#120e0f" strokeWidth="0.9" />
             </g>
@@ -442,7 +492,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
         </button>
 
         {dockOpen && (
-          <div className="flex flex-wrap items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-[#161112]/92 border border-white/15 shadow-2xl">
+          <div className="flex flex-wrap sm:flex-nowrap items-center justify-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#161112]/92 border border-white/15 shadow-2xl">
             <button
               type="button"
               tabIndex={-1}
@@ -450,10 +500,28 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
                 e.currentTarget.blur();
                 onTogglePerspective();
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
             >
               <Eye className="w-3.5 h-3.5 text-[#e5a91a]" />
               {perspective === 'first-person' ? '1st Person [V]' : '3rd Person [V]'}
+            </button>
+
+            <button
+              type="button"
+              tabIndex={-1}
+              aria-pressed={hud.showColliders}
+              onClick={(e) => {
+                e.currentTarget.blur();
+                onToggleShowColliders();
+              }}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium border cursor-pointer whitespace-nowrap shrink-0 transition-colors ${
+                hud.showColliders
+                  ? 'bg-emerald-950/90 hover:bg-emerald-900 text-emerald-100 border-emerald-400/70'
+                  : 'bg-[#231b1c] hover:bg-[#312628] text-[#f5f2eb] border-white/10'
+              }`}
+            >
+              <Box className={`w-3.5 h-3.5 ${hud.showColliders ? 'text-emerald-300' : 'text-[#e5a91a]'}`} />
+              Hit-Boxes [H]
             </button>
 
             <button
@@ -463,7 +531,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
                 e.currentTarget.blur();
                 onOpenAssistant('assistant');
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#7b1113] hover:bg-[#961619] text-xs font-semibold text-white border border-[#e5a91a]/50 cursor-pointer whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-[#7b1113] hover:bg-[#961619] text-xs font-semibold text-white border border-[#e5a91a]/50 cursor-pointer whitespace-nowrap shrink-0"
             >
               <Compass className="w-3.5 h-3.5 text-[#e5a91a]" />
               Campus Assistant [Tab]
@@ -476,7 +544,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
                 e.currentTarget.blur();
                 onOpenAssistant('map');
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
             >
               <MapIcon className="w-3.5 h-3.5 text-[#e5a91a]" />
               Map & Travel [M]
@@ -489,7 +557,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
                 e.currentTarget.blur();
                 onCycleTimeOfDay();
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
             >
               {timeOfDay === 'night' ? (
                 <Moon className="w-3.5 h-3.5 text-[#f2ca68]" />
@@ -506,7 +574,7 @@ export const CampusHUD: React.FC<CampusHUDProps> = ({
                 e.currentTarget.blur();
                 onCycleWeather();
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-[#231b1c] hover:bg-[#312628] text-xs font-medium text-[#f5f2eb] border border-white/10 cursor-pointer whitespace-nowrap shrink-0"
             >
               <CloudRain className="w-3.5 h-3.5 text-[#e5a91a]" />
               {WEATHER_LABELS[weather]}

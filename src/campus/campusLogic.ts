@@ -8,6 +8,7 @@ import {
   Vec2,
 } from './campusData';
 import { haversineDistanceMeters } from './geoProjection';
+import { unscaleWorldPoint } from './worldScale';
 
 export interface NearestLandmarkResult {
   landmark: CampusLandmark;
@@ -37,10 +38,11 @@ export function distance2D(a: Vec2, b: Vec2): number {
 }
 
 /**
- * Calibrated meters-per-Three.js-world-unit ratio derived from Google Maps WGS84
- * measurements across PUP Main Gate -> Obelisk (~156m) and Main Gate -> Old Sta. Mesa (~215m).
+ * Calibrated meters-per-Three.js-world-unit ratio after applying Google Maps
+ * CAMPUS_XZ_SCALE (1.62): 1 world unit ≈ 1.04 real-world meters across
+ * Main Gate -> Old Sta. Mesa (~215m) and Main Gate -> Obelisk (~118–130m).
  */
-export const CAMPUS_METERS_PER_WORLD_UNIT = 1.68;
+export const CAMPUS_METERS_PER_WORLD_UNIT = 1.04;
 
 export function estimateRealWorldDistanceMeters(a: Vec2, b: Vec2): number {
   return Math.round(distance2D(a, b) * CAMPUS_METERS_PER_WORLD_UNIT);
@@ -141,9 +143,186 @@ export function findNearbyLandmarks(
     .slice(0, limit);
 }
 
+export interface CollisionResolutionResult {
+  x: number;
+  z: number;
+  vx: number;
+  vz: number;
+  collided: boolean;
+  normalX: number;
+  normalZ: number;
+  hitColliderIds: string[];
+}
+
+export interface ColliderDebugDescriptor {
+  id: string;
+  cx: number;
+  cz: number;
+  width: number;
+  depth: number;
+  rotY: number;
+  isOBB: boolean;
+}
+
 /**
- * Resolves a player circle (x, z, radius) against static campus AABB obstacles
- * and outer playable campus bounds using smooth axis separation (sliding collision).
+ * Returns the exact world-space center, full dimensions, and Y rotation of an AABB or rotated OBB
+ * collider so the 3D hit-box visualizer matches the physics solver 1:1.
+ */
+export function getColliderDebugDescriptor(box: AABB): ColliderDebugDescriptor {
+  if (
+    box.rotY !== undefined &&
+    box.cx !== undefined &&
+    box.cz !== undefined &&
+    box.halfW !== undefined &&
+    box.halfD !== undefined
+  ) {
+    return {
+      id: box.id,
+      cx: box.cx,
+      cz: box.cz,
+      width: box.halfW * 2,
+      depth: box.halfD * 2,
+      rotY: box.rotY,
+      isOBB: true,
+    };
+  }
+  return {
+    id: box.id,
+    cx: (box.minX + box.maxX) * 0.5,
+    cz: (box.minZ + box.maxZ) * 0.5,
+    width: Math.max(0.05, box.maxX - box.minX),
+    depth: Math.max(0.05, box.maxZ - box.minZ),
+    rotY: 0,
+    isOBB: false,
+  };
+}
+
+/**
+ * Resolves a single circle against either an axis-aligned AABB or a rotated OBB
+ * (when rotY, cx, cz, halfW, halfD are provided), returning pushed position and outward unit normal.
+ */
+function resolveCircleAgainstBox(
+  px: number,
+  pz: number,
+  radius: number,
+  box: AABB,
+): { x: number; z: number; hit: boolean; nx: number; nz: number } {
+  // Fast broadphase AABB reject
+  if (
+    px + radius <= box.minX ||
+    px - radius >= box.maxX ||
+    pz + radius <= box.minZ ||
+    pz - radius >= box.maxZ
+  ) {
+    return { x: px, z: pz, hit: false, nx: 0, nz: 0 };
+  }
+
+  if (
+    box.rotY !== undefined &&
+    box.cx !== undefined &&
+    box.cz !== undefined &&
+    box.halfW !== undefined &&
+    box.halfD !== undefined
+  ) {
+    // Transform circle center into OBB local space (matching Three.js rotation.y = rotY)
+    // World -> Local inverse of [cos, sin; -sin, cos] (where Three.js Ry maps local (x,z) to (x*c + z*s, -x*s + z*c))
+    const c = Math.cos(box.rotY);
+    const s = Math.sin(box.rotY);
+    const relX = px - box.cx;
+    const relZ = pz - box.cz;
+    const localX = relX * c - relZ * s;
+    const localZ = relX * s + relZ * c;
+
+    const clampedX = Math.max(-box.halfW, Math.min(localX, box.halfW));
+    const clampedZ = Math.max(-box.halfD, Math.min(localZ, box.halfD));
+    const dx = localX - clampedX;
+    const dz = localZ - clampedZ;
+    const distSq = dx * dx + dz * dz;
+
+    if (distSq >= radius * radius) {
+      return { x: px, z: pz, hit: false, nx: 0, nz: 0 };
+    }
+
+    let pushLocalX = 0;
+    let pushLocalZ = 0;
+    let nLocalX = 0;
+    let nLocalZ = 0;
+    if (distSq > 1e-8) {
+      const dist = Math.sqrt(distSq);
+      const overlap = radius - dist;
+      nLocalX = dx / dist;
+      nLocalZ = dz / dist;
+      pushLocalX = nLocalX * overlap;
+      pushLocalZ = nLocalZ * overlap;
+    } else {
+      const penLeft = Math.abs(localX + box.halfW);
+      const penRight = Math.abs(box.halfW - localX);
+      const penTop = Math.abs(localZ + box.halfD);
+      const penBottom = Math.abs(box.halfD - localZ);
+      const minPen = Math.min(penLeft, penRight, penTop, penBottom);
+      if (minPen === penLeft) {
+        nLocalX = -1;
+        pushLocalX = -(box.halfW + radius) - localX;
+      } else if (minPen === penRight) {
+        nLocalX = 1;
+        pushLocalX = box.halfW + radius - localX;
+      } else if (minPen === penTop) {
+        nLocalZ = -1;
+        pushLocalZ = -(box.halfD + radius) - localZ;
+      } else {
+        nLocalZ = 1;
+        pushLocalZ = box.halfD + radius - localZ;
+      }
+    }
+
+    // Rotate push & normal back from OBB local space to world space
+    const worldPushX = pushLocalX * c + pushLocalZ * s;
+    const worldPushZ = -pushLocalX * s + pushLocalZ * c;
+    const worldNx = nLocalX * c + nLocalZ * s;
+    const worldNz = -nLocalX * s + nLocalZ * c;
+    return {
+      x: px + worldPushX,
+      z: pz + worldPushZ,
+      hit: true,
+      nx: worldNx,
+      nz: worldNz,
+    };
+  }
+
+  // Standard AABB resolution
+  const closestX = Math.max(box.minX, Math.min(px, box.maxX));
+  const closestZ = Math.max(box.minZ, Math.min(pz, box.maxZ));
+  const dx = px - closestX;
+  const dz = pz - closestZ;
+  const distSq = dx * dx + dz * dz;
+
+  if (distSq >= radius * radius) {
+    return { x: px, z: pz, hit: false, nx: 0, nz: 0 };
+  }
+
+  if (distSq > 1e-8) {
+    const dist = Math.sqrt(distSq);
+    const overlap = radius - dist;
+    const nx = dx / dist;
+    const nz = dz / dist;
+    return { x: px + nx * overlap, z: pz + nz * overlap, hit: true, nx, nz };
+  }
+
+  const penLeft = Math.abs(px - box.minX);
+  const penRight = Math.abs(box.maxX - px);
+  const penTop = Math.abs(pz - box.minZ);
+  const penBottom = Math.abs(box.maxZ - pz);
+  const minPen = Math.min(penLeft, penRight, penTop, penBottom);
+
+  if (minPen === penLeft) return { x: box.minX - radius, z: pz, hit: true, nx: -1, nz: 0 };
+  if (minPen === penRight) return { x: box.maxX + radius, z: pz, hit: true, nx: 1, nz: 0 };
+  if (minPen === penTop) return { x: px, z: box.minZ - radius, hit: true, nx: 0, nz: -1 };
+  return { x: px, z: box.maxZ + radius, hit: true, nx: 0, nz: 1 };
+}
+
+/**
+ * Resolves a player or NPC circle (x, z, radius) against static campus AABB & rotated OBB
+ * obstacles and outer playable bounds using multi-pass Gauss-Seidel separation.
  */
 export function resolveCircleAABBCollisions(
   x: number,
@@ -155,44 +334,191 @@ export function resolveCircleAABBCollisions(
   let px = Math.max(bounds.minX + radius, Math.min(bounds.maxX - radius, x));
   let pz = Math.max(bounds.minZ + radius, Math.min(bounds.maxZ - radius, z));
 
-  // Two passes stabilize corner slides cleanly
-  for (let pass = 0; pass < 2; pass++) {
+  for (let pass = 0; pass < 4; pass++) {
+    let anyHit = false;
     for (let i = 0; i < colliders.length; i++) {
-      const box = colliders[i];
-      const closestX = Math.max(box.minX, Math.min(px, box.maxX));
-      const closestZ = Math.max(box.minZ, Math.min(pz, box.maxZ));
-
-      const dx = px - closestX;
-      const dz = pz - closestZ;
-      const distSq = dx * dx + dz * dz;
-
-      if (distSq < radius * radius) {
-        if (distSq > 1e-8) {
-          const dist = Math.sqrt(distSq);
-          const overlap = radius - dist;
-          px += (dx / dist) * overlap;
-          pz += (dz / dist) * overlap;
-        } else {
-          // Center is inside box: push out along minimum penetration axis
-          const penLeft = Math.abs(px - box.minX);
-          const penRight = Math.abs(box.maxX - px);
-          const penTop = Math.abs(pz - box.minZ);
-          const penBottom = Math.abs(box.maxZ - pz);
-          const minPen = Math.min(penLeft, penRight, penTop, penBottom);
-
-          if (minPen === penLeft) px = box.minX - radius;
-          else if (minPen === penRight) px = box.maxX + radius;
-          else if (minPen === penTop) pz = box.minZ - radius;
-          else pz = box.maxZ + radius;
-        }
+      const res = resolveCircleAgainstBox(px, pz, radius, colliders[i]);
+      if (res.hit) {
+        px = res.x;
+        pz = res.z;
+        anyHit = true;
       }
     }
+    if (!anyHit) break;
   }
 
   px = Math.max(bounds.minX + radius, Math.min(bounds.maxX - radius, px));
   pz = Math.max(bounds.minZ + radius, Math.min(bounds.maxZ - radius, pz));
 
   return { x: px, z: pz };
+}
+
+/**
+ * Continuous swept circle-vs-AABB/OBB physics solver.
+ * Substeps large displacements (max 0.14m/step) to guarantee zero wall tunneling,
+ * runs 4 Gauss-Seidel passes per step, and zeroes inward normal velocity so walking
+ * into any wall brings the character to a solid, realistic stop while allowing smooth oblique sliding.
+ */
+export function resolveCircleCollisionsWithNormal(
+  prevX: number,
+  prevZ: number,
+  targetX: number,
+  targetZ: number,
+  vx: number,
+  vz: number,
+  radius: number,
+  colliders: AABB[],
+  bounds = CAMPUS_BOUNDS,
+): CollisionResolutionResult {
+  const totalDx = targetX - prevX;
+  const totalDz = targetZ - prevZ;
+  const totalDist = Math.hypot(totalDx, totalDz);
+  const steps = Math.max(1, Math.min(24, Math.ceil(totalDist / 0.14)));
+
+  let px = prevX;
+  let pz = prevZ;
+  let outVx = vx;
+  let outVz = vz;
+  let collided = false;
+  let accumNx = 0;
+  let accumNz = 0;
+  const hitIds = new Set<string>();
+
+  for (let s = 1; s <= steps; s++) {
+    const stepDx = totalDx / steps;
+    const stepDz = totalDz / steps;
+    px += stepDx;
+    pz += stepDz;
+
+    // Clamp to outer campus boundary & cancel outward boundary velocity
+    if (px < bounds.minX + radius) {
+      px = bounds.minX + radius;
+      if (outVx < 0) outVx = 0;
+      collided = true;
+      accumNx += 1;
+      hitIds.add('world-bounds-west');
+    } else if (px > bounds.maxX - radius) {
+      px = bounds.maxX - radius;
+      if (outVx > 0) outVx = 0;
+      collided = true;
+      accumNx -= 1;
+      hitIds.add('world-bounds-east');
+    }
+    if (pz < bounds.minZ + radius) {
+      pz = bounds.minZ + radius;
+      if (outVz < 0) outVz = 0;
+      collided = true;
+      accumNz += 1;
+      hitIds.add('world-bounds-north');
+    } else if (pz > bounds.maxZ - radius) {
+      pz = bounds.maxZ - radius;
+      if (outVz > 0) outVz = 0;
+      collided = true;
+      accumNz -= 1;
+      hitIds.add('world-bounds-south');
+    }
+
+    for (let pass = 0; pass < 4; pass++) {
+      let stepHit = false;
+      for (let i = 0; i < colliders.length; i++) {
+        const res = resolveCircleAgainstBox(px, pz, radius, colliders[i]);
+        if (res.hit) {
+          px = res.x;
+          pz = res.z;
+          collided = true;
+          stepHit = true;
+          accumNx += res.nx;
+          accumNz += res.nz;
+          hitIds.add(colliders[i].id);
+
+          // Cancel inward normal velocity component (realistic solid stop + smooth oblique slide)
+          const vn = outVx * res.nx + outVz * res.nz;
+          if (vn < 0) {
+            outVx -= vn * res.nx;
+            outVz -= vn * res.nz;
+          }
+        }
+      }
+      if (!stepHit) break;
+    }
+  }
+
+  // Final safety clamp
+  px = Math.max(bounds.minX + radius, Math.min(bounds.maxX - radius, px));
+  pz = Math.max(bounds.minZ + radius, Math.min(bounds.maxZ - radius, pz));
+
+  const nLen = Math.hypot(accumNx, accumNz);
+  return {
+    x: px,
+    z: pz,
+    vx: Math.abs(outVx) < 1e-4 ? 0 : outVx,
+    vz: Math.abs(outVz) < 1e-4 ? 0 : outVz,
+    collided,
+    normalX: nLen > 1e-6 ? accumNx / nLen : 0,
+    normalZ: nLen > 1e-6 ? accumNz / nLen : 0,
+    hitColliderIds: Array.from(hitIds),
+  };
+}
+
+/**
+ * Tests whether a 2D point lies inside (or within margin of) an AABB or rotated OBB collider.
+ */
+export function pointHitsCollider(x: number, z: number, margin: number, box: AABB): boolean {
+  if (
+    x < box.minX - margin ||
+    x > box.maxX + margin ||
+    z < box.minZ - margin ||
+    z > box.maxZ + margin
+  ) {
+    return false;
+  }
+  if (
+    box.rotY !== undefined &&
+    box.cx !== undefined &&
+    box.cz !== undefined &&
+    box.halfW !== undefined &&
+    box.halfD !== undefined
+  ) {
+    const c = Math.cos(box.rotY);
+    const s = Math.sin(box.rotY);
+    const relX = x - box.cx;
+    const relZ = z - box.cz;
+    const localX = relX * c - relZ * s;
+    const localZ = relX * s + relZ * c;
+    return (
+      Math.abs(localX) <= box.halfW + margin && Math.abs(localZ) <= box.halfD + margin
+    );
+  }
+  return true;
+}
+
+/**
+ * Sweeps the 3rd-person camera boom backward from the player and pulls smoothly inward
+ * (all the way down to minDist = 0.55m) whenever any AABB or rotated OBB wall sits behind the player.
+ */
+export function computeSafeCameraDistance(
+  playerX: number,
+  playerZ: number,
+  forwardX: number,
+  forwardZ: number,
+  desiredDist: number,
+  colliders: AABB[],
+  minDist = 0.55,
+  margin = 0.42,
+): number {
+  const samples = 14;
+  for (let i = 1; i <= samples; i++) {
+    const t = i / samples;
+    const sx = playerX - forwardX * desiredDist * t;
+    const sz = playerZ - forwardZ * desiredDist * t;
+    for (let c = 0; c < colliders.length; c++) {
+      if (pointHitsCollider(sx, sz, margin, colliders[c])) {
+        const safeT = Math.max(0, (i - 1) / samples);
+        return Math.max(minDist, desiredDist * safeT);
+      }
+    }
+  }
+  return desiredDist;
 }
 
 /**
@@ -340,27 +666,28 @@ export function matchLandmarkFromQuery(
     ['sampaguita-canteen', ['sampaguita', 'university canteen', 'student canteen', 'student center', 'canteen']],
     ['tahanan-ng-alumni', ['alumni', 'tahanan ng alumni', 'chk', 'human kinetics', 'pe building', 'nftrdc', 'food technology']],
     ['food-nutrition-strip', ['food and nutrition', 'gabriela silang', 'fmo', 'facility management', 'maintenance', 'gazebo']],
-    ['tahanan-ng-atleta', ['atleta', 'tahanan ng atleta', 'athletes', 'oval gate']],
-    ['visitors-lounge-courts', ['visitor', 'lounge', 'souvenir', 'tennis', 'basketball', 'open court', 'gym gate']],
+    ['tahanan-ng-atleta', ['atleta', 'tahanan ng atleta', 'araneta', 'athletes', 'oval gate', 'south side gate']],
+    ['visitors-lounge-courts', ['visitor', 'lounge', 'souvenir', 'tennis', 'basketball', 'open court', 'gym gate', 'pup side gate', 'side gate']],
     ['printing-psmo', ['printing press', 'psmo', 'property', 'supply', 'water tower', 'water pump']],
     ['old-stamesa-stopshop', ['old sta mesa', 'old santa mesa', 'stop and shop', 'stop & shop', 'stop&shop', 'cebuana', 'jeepney terminal', 'pureza']],
-    ['pnr-stamesa', ['pnr', 'train', 'railway', 'railroad', 'tracks', 'viaduct', 'nlex', 'slex', 'connector', 'skyway', 'rr xing']],
+    ['pnr-stamesa', ['pnr', 'train', 'railway', 'railroad', 'rr crossing', 'rr xing', 'tracks', 'viaduct', 'nlex', 'slex', 'connector', 'skyway']],
     ['anonas-teresa', ['teresa', 'teresa chapel', 'mahal na krus', 'brgy 591', 'barangay 591', '591', 'banana island', 'rbs', 'palceso', 'chacha', 'pst', 'pastil', 'takam', 'smokle', '7-eleven', '7 eleven', 'eufrosino', 'ramos', 'rdp', 'smile pod', 'elegance', 'angels burger', 'palawan', 'esperanza', 'covered court', 'mubyl', 'outside', 'tricycle', 'dorm', 'photocopy']],
-    ['maui-el-pueblo', ['maui', 'maui oasis', 'el pueblo', 'futura', 'futura centro', 'condo', 'condominium', 'oval wall', 'south anonas', 'anonas']],
+    ['maui-el-pueblo', ['maui oasis', 'maui', 'el pueblo', 'futura centro', 'futura', 'condo', 'condominium']],
+    ['barangay-630-hall', ['barangay 630', 'brgy 630', 'barangay hall', 'alfamart', 'eskinita', 'health center', 'south anonas', 'oval wall', 'toda', 'anonas']],
     ['pup-ferry-station', ['ferry', 'mmda', 'pier', 'dock', 'boat', 'pureza ferry']],
     ['north-wing-construction', ['north wing', 'construction', 'under construction', 'dpwh', 'crane', 'unfinished', 'redevelopment']],
     ['nallrc', ['nallrc', 'library', 'ninoy aquino', 'books']],
-    ['main-building', ['main building', 'dome', 'south wing', 'east wing', 'west wing', 'classroom', 's-104']],
+    ['main-building', ['main building', 'dome', 'south wing', 'east wing', 'west wing', 'classroom', 's-104', 'claro m recto', 'recto hall']],
     ['lagoon', ['lagoon', 'amphitheater', 'food stall', 'kiosk']],
     ['obelisk-freedom-park', ['obelisk', 'freedom park', 'star', 'flagpole', 'prudente']],
-    ['main-gate', ['main gate', 'pylon', 'mural', 'entrance']],
+    ['main-gate', ['main gate', 'pylon', 'mural', 'entrance', 'dambanang mabini']],
     ['catwalk', ['catwalk', 'covered walkway']],
     ['mabini-shrine', ['mabini shrine', 'mabini museum', 'museo', 'shrine', 'nhcp']],
     ['charlie-del-rosario', ['charlie', 'student council', 'org']],
     ['interfaith-chapel', ['chapel', 'interfaith', 'church', 'prayer']],
     ['oval-grandstand', ['oval', 'grandstand', 'track', 'field', 'bleachers']],
     ['gymnasium', ['gym', 'gymnasium', 'swimming pool', 'pool', 'esrc']],
-    ['linear-park', ['linear park', 'pasig river', 'river', 'promenade']],
+    ['linear-park', ['linear park', 'pasig river', 'ilog pasig', 'ilog', 'river', 'promenade']],
   ];
 
   for (const [id, terms] of aliases) {
@@ -371,7 +698,8 @@ export function matchLandmarkFromQuery(
   return null;
 }
 
-export function getSurfaceTypeAt(x: number, z: number): 'concrete' | 'grass' | 'interior' | 'water' {
+export function getSurfaceTypeAt(worldX: number, worldZ: number): 'concrete' | 'grass' | 'interior' | 'water' {
+  const { x, z } = unscaleWorldPoint({ x: worldX, z: worldZ });
   // Inside Main Building ground floor (Central Dome Rotunda + East Wing Room E-104)
   if (
     Math.hypot(x - -28, z - 24) < 11.2 ||
@@ -438,7 +766,7 @@ export const CAMPUS_STRUCTURE_FOOTPRINTS: StructureFootprint[] = [
   { id: 'gazebo-sw', label: 'PUP Gazebo SW (#15)', minX: -44.2, maxX: -37.8, minZ: 48.8, maxZ: 55.2 },
   { id: 'pup-grandstand', label: 'PUP Grandstand (#16)', minX: 27.3, maxX: 36.9, minZ: 21.4, maxZ: 43.4 },
   { id: 'interfaith-chapel', label: 'Interfaith Chapel (#13)', minX: -13.5, maxX: 9.5, minZ: 30.5, maxZ: 53.5 },
-  { id: 'tahanan-ng-atleta', label: 'Tahanan ng Atleta (#18)', minX: 18.5, maxX: 33.5, minZ: 62.5, maxZ: 72.5 },
+  { id: 'tahanan-ng-atleta', label: 'Tahanan ng Atleta (#18)', minX: 20.0, maxX: 35.0, minZ: 63.8, maxZ: 73.8 },
   { id: 'gabriela-silang', label: 'Gabriela Silang Building (#19)', minX: -0.5, maxX: 14.5, minZ: 62.5, maxZ: 72.5 },
   { id: 'food-nutrition-bldg', label: 'Food & Nutrition Building (#20)', minX: -29.0, maxX: -4.0, minZ: 62.5, maxZ: 72.5 },
   { id: 'facility-mgmt-office', label: 'Facility Management Office (#21)', minX: -50.5, maxX: -32.5, minZ: 62.5, maxZ: 72.5 },

@@ -11,14 +11,17 @@ import {
   WeatherPreset,
 } from '../campus/campusData';
 import {
+  computeSafeCameraDistance,
   dampAngle,
   findNearestLandmark,
   getSurfaceTypeAt,
-  resolveCircleAABBCollisions,
+  resolveCircleCollisionsWithNormal,
   stepHorizontalVelocity,
 } from '../campus/campusLogic';
+import { CAMPUS_XZ_SCALE, CAMPUS_Y_SCALE } from '../campus/worldScale';
 import { CampusAudioEngine } from './audioEngine';
 import { buildPupCampusWorld, BuiltCampusWorld } from './campusBuilder';
+import { ColliderDebugOverlay } from './colliderDebugOverlay';
 import {
   animateHumanWalk,
   ArticulatedHuman,
@@ -49,6 +52,9 @@ export interface SimulationHudSnapshot {
   prompt: InteractionPrompt | null;
   npcs: Array<{ id: string; name: string; roleCategory: string; x: number; z: number }>;
   activeWaypointId: string | null;
+  showColliders: boolean;
+  colliderCount: number;
+  blockedByColliderIds: string[];
 }
 
 export interface SimulationCallbacks {
@@ -93,7 +99,7 @@ const TIME_PRESETS: Record<
     hemiGround: 0x5c5344,
     hemiIntensity: 0.9,
     skyColor: 0xb6dbf2,
-    fogDensity: 0.0028,
+    fogDensity: 0.0021,
     turbidity: 4.2,
     rayleigh: 1.35,
     mieCoefficient: 0.0045,
@@ -115,7 +121,7 @@ const TIME_PRESETS: Record<
     hemiGround: 0x6b604e,
     hemiIntensity: 0.96,
     skyColor: 0xa2d4f7,
-    fogDensity: 0.0023,
+    fogDensity: 0.0018,
     turbidity: 3.2,
     rayleigh: 1.05,
     mieCoefficient: 0.0035,
@@ -262,6 +268,14 @@ export class CampusSimulation {
   private currentPrompt: InteractionPrompt | null = null;
   private lastEnteredLandmarkId: string | null = null;
 
+  // Collider Hit-Box Visualization Mode & live contact feedback
+  private showColliders = false;
+  private colliderDebugOverlay: ColliderDebugOverlay | null = null;
+  private lastHitColliderIds: string[] = [];
+  private lastContactNormalX = 0;
+  private lastContactNormalZ = 0;
+  private contactHoldTimer = 0;
+
   // Loop & throttling (performance.now replaces deprecated THREE.Clock)
   private lastFrameMs = performance.now();
   private elapsed = 0;
@@ -311,13 +325,13 @@ export class CampusSimulation {
     this.scene.environment = this.envRT.texture;
     pmrem.dispose();
 
-    // Camera (extended far plane for physical Sky dome)
+    // Camera (extended far plane for 1:1 Google Maps scale & physical Sky dome)
     const aspect = (container.clientWidth || window.innerWidth) / (container.clientHeight || window.innerHeight);
-    this.camera = new THREE.PerspectiveCamera(60, aspect, 0.15, 620);
+    this.camera = new THREE.PerspectiveCamera(60, aspect, 0.15, 920);
 
     // Physical Atmospheric Sky Dome (Manila tropical sky gradients & solar scattering)
     this.skyDome = new Sky();
-    this.skyDome.scale.setScalar(460);
+    this.skyDome.scale.setScalar(760);
     this.scene.add(this.skyDome);
 
     // Warm Key Sun + Cool Sky/Ground Hemisphere + Subtle Opposite Sky-Bounce Fill Light
@@ -325,12 +339,12 @@ export class CampusSimulation {
     this.scene.add(this.hemiLight);
 
     this.sunLight = new THREE.DirectionalLight(0xfff0d4, 2.35);
-    this.sunLight.position.set(95, 62, -40);
+    this.sunLight.position.set(150, 96, -65);
     this.sunLight.castShadow = !this.isSoftwareGl;
     this.sunLight.shadow.mapSize.set(2048, 2048);
     this.sunLight.shadow.camera.near = 10;
-    this.sunLight.shadow.camera.far = 290;
-    const d = 104;
+    this.sunLight.shadow.camera.far = 480;
+    const d = 210;
     this.sunLight.shadow.camera.left = -d;
     this.sunLight.shadow.camera.right = d;
     this.sunLight.shadow.camera.top = d;
@@ -374,12 +388,38 @@ export class CampusSimulation {
       this.playerVelX = 0;
       this.playerVelZ = 0;
       this.playerVelY = 0;
+      this.lastHitColliderIds = [];
+      this.lastContactNormalX = 0;
+      this.lastContactNormalZ = 0;
+      this.contactHoldTimer = 0;
       this.playerAvatar.root.position.copy(this.playerPos);
       this.playerAvatar.root.rotation.y = this.playerYaw + Math.PI;
+      this.colliderDebugOverlay?.update(
+        this.playerPos,
+        this.lastHitColliderIds,
+        this.lastContactNormalX,
+        this.lastContactNormalZ,
+        this.world.doors,
+      );
       this.snapCameraToPlayer();
       this.renderer.render(this.scene, this.camera);
       this.emitHudSnapshot();
     };
+    (window as unknown as Record<string, unknown>).__PUP_SET_SHOW_COLLIDERS__ = (show: boolean) => {
+      this.setShowColliders(show);
+      this.renderer.render(this.scene, this.camera);
+      return this.showColliders;
+    };
+    (window as unknown as Record<string, unknown>).__PUP_INSPECT_STATE__ = () => ({
+      x: Number(this.playerPos.x.toFixed(3)),
+      z: Number(this.playerPos.z.toFixed(3)),
+      vx: Number(this.playerVelX.toFixed(3)),
+      vz: Number(this.playerVelZ.toFixed(3)),
+      yaw: Number(this.playerYaw.toFixed(3)),
+      colliders: this.world.colliders.length,
+      showColliders: this.showColliders,
+      blockedBy: this.lastHitColliderIds,
+    });
 
     // Player Articulated Iskolar ng Bayan Avatar (visible in 3rd-person mode)
     const playerGeos = {
@@ -646,8 +686,19 @@ export class CampusSimulation {
     this.playerVelX = 0;
     this.playerVelZ = 0;
     this.playerVelY = 0;
+    this.lastHitColliderIds = [];
+    this.lastContactNormalX = 0;
+    this.lastContactNormalZ = 0;
+    this.contactHoldTimer = 0;
     this.playerAvatar.root.position.copy(this.playerPos);
     this.playerAvatar.root.rotation.y = this.playerYaw + Math.PI;
+    this.colliderDebugOverlay?.update(
+      this.playerPos,
+      this.lastHitColliderIds,
+      this.lastContactNormalX,
+      this.lastContactNormalZ,
+      this.world.doors,
+    );
     this.snapCameraToPlayer();
     this.renderer.render(this.scene, this.camera);
     this.currentPrompt = this.computeNearestInteraction();
@@ -657,6 +708,60 @@ export class CampusSimulation {
 
   public getPlayerPosition() {
     return { x: this.playerPos.x, z: this.playerPos.z };
+  }
+
+  public setShowColliders(show: boolean) {
+    this.showColliders = show;
+    if (show && !this.colliderDebugOverlay) {
+      this.colliderDebugOverlay = new ColliderDebugOverlay(
+        this.scene,
+        this.world.colliders,
+        this.world.doors,
+        0.5,
+      );
+    }
+    if (this.colliderDebugOverlay) {
+      this.colliderDebugOverlay.setVisible(show);
+      if (show) {
+        this.colliderDebugOverlay.update(
+          this.playerPos,
+          this.lastHitColliderIds,
+          this.lastContactNormalX,
+          this.lastContactNormalZ,
+          this.world.doors,
+        );
+      }
+    }
+    this.emitHudSnapshot();
+  }
+
+  public toggleShowColliders(): boolean {
+    this.setShowColliders(!this.showColliders);
+    return this.showColliders;
+  }
+
+  public getShowColliders(): boolean {
+    return this.showColliders;
+  }
+
+  private getActiveColliders() {
+    let hasClosedDoor = false;
+    for (let i = 0; i < this.world.doors.length; i++) {
+      const d = this.world.doors[i];
+      if (!d.isOpen && d.openProgress < 0.65) {
+        hasClosedDoor = true;
+        break;
+      }
+    }
+    if (!hasClosedDoor) return this.world.colliders;
+    const active = this.world.colliders.slice();
+    for (let i = 0; i < this.world.doors.length; i++) {
+      const d = this.world.doors[i];
+      if (!d.isOpen && d.openProgress < 0.65) {
+        active.push(d.closedCollider);
+      }
+    }
+    return active;
   }
 
   public triggerInteract() {
@@ -930,7 +1035,7 @@ export class CampusSimulation {
     }
 
     const sprinting = this.keys.has('ShiftLeft') || this.keys.has('ShiftRight') || this.virtualSprint;
-    const maxSpeed = sprinting ? 10.6 : 6.2;
+    const maxSpeed = sprinting ? 10.8 : 5.4;
 
     let targetVx = 0;
     let targetVz = 0;
@@ -966,23 +1071,37 @@ export class CampusSimulation {
 
     let movedDist = 0;
     const horizSpeed = Math.hypot(this.playerVelX, this.playerVelZ);
-    if (!this.isSitting && horizSpeed > 0.01) {
-      const totalStep = horizSpeed * dt;
-      // Sub-step large moves so wall/curb sliding never snags on corners
-      const subSteps = totalStep > 0.25 ? 2 : 1;
-      const subDt = dt / subSteps;
+    const activeColliders = this.getActiveColliders();
+    if (!this.isSitting && (horizSpeed > 0.01 || inputMag > 0.04)) {
       const startX = this.playerPos.x;
       const startZ = this.playerPos.z;
+      const resolved = resolveCircleCollisionsWithNormal(
+        startX,
+        startZ,
+        startX + this.playerVelX * dt,
+        startZ + this.playerVelZ * dt,
+        this.playerVelX,
+        this.playerVelZ,
+        0.5,
+        activeColliders,
+      );
+      this.playerPos.x = resolved.x;
+      this.playerPos.z = resolved.z;
+      this.playerVelX = resolved.vx;
+      this.playerVelZ = resolved.vz;
 
-      for (let s = 0; s < subSteps; s++) {
-        const resolved = resolveCircleAABBCollisions(
-          this.playerPos.x + this.playerVelX * subDt,
-          this.playerPos.z + this.playerVelZ * subDt,
-          0.46,
-          this.world.colliders,
-        );
-        this.playerPos.x = resolved.x;
-        this.playerPos.z = resolved.z;
+      if (resolved.collided && resolved.hitColliderIds.length > 0) {
+        this.lastHitColliderIds = resolved.hitColliderIds;
+        this.lastContactNormalX = resolved.normalX;
+        this.lastContactNormalZ = resolved.normalZ;
+        this.contactHoldTimer = 0.28;
+      } else {
+        this.contactHoldTimer = Math.max(0, this.contactHoldTimer - dt);
+        if (this.contactHoldTimer <= 0) {
+          this.lastHitColliderIds = [];
+          this.lastContactNormalX = 0;
+          this.lastContactNormalZ = 0;
+        }
       }
 
       movedDist = Math.hypot(this.playerPos.x - startX, this.playerPos.z - startZ);
@@ -998,6 +1117,13 @@ export class CampusSimulation {
           12,
           dt,
         );
+      }
+    } else if (this.contactHoldTimer > 0) {
+      this.contactHoldTimer = Math.max(0, this.contactHoldTimer - dt);
+      if (this.contactHoldTimer <= 0) {
+        this.lastHitColliderIds = [];
+        this.lastContactNormalX = 0;
+        this.lastContactNormalZ = 0;
       }
     }
 
@@ -1054,26 +1180,17 @@ export class CampusSimulation {
   }
 
   private computeSafeThirdPersonDist(desiredDist: number, forwardX: number, forwardZ: number): number {
-    // Sample along camera boom to pull inward cleanly near narrow sidewalks & building facades
-    const samples = 5;
-    const margin = 0.55;
-    for (let i = 1; i <= samples; i++) {
-      const t = i / samples;
-      const sx = this.playerPos.x - forwardX * desiredDist * t;
-      const sz = this.playerPos.z - forwardZ * desiredDist * t;
-      for (let c = 0; c < this.world.colliders.length; c++) {
-        const box = this.world.colliders[c];
-        if (
-          sx >= box.minX - margin &&
-          sx <= box.maxX + margin &&
-          sz >= box.minZ - margin &&
-          sz <= box.maxZ + margin
-        ) {
-          return Math.max(2.1, desiredDist * ((i - 1) / samples));
-        }
-      }
-    }
-    return desiredDist;
+    // High-resolution OBB+AABB camera boom sweep pulls cleanly down to 0.55m so camera never clips behind walls
+    return computeSafeCameraDistance(
+      this.playerPos.x,
+      this.playerPos.z,
+      forwardX,
+      forwardZ,
+      desiredDist,
+      this.getActiveColliders(),
+      0.55,
+      0.42,
+    );
   }
 
   private updateCamera(dt: number) {
@@ -1081,11 +1198,11 @@ export class CampusSimulation {
       // Live World Camera Tour: elevated aerial sweep framing PUP Main Building star wings,
       // NE North Wing tower crane, Interfaith Chapel terracotta pyramid, Freedom Park, Obelisk & Lagoon
       const t = this.elapsed * 0.12 + 0.12;
-      const camX = -2 + Math.cos(t) * 52;
-      const camZ = 8 + Math.sin(t) * 38;
-      const camY = 23.5 + Math.sin(t * 1.2) * 2.5;
+      const camX = (-2 + Math.cos(t) * 52) * CAMPUS_XZ_SCALE;
+      const camZ = (8 + Math.sin(t) * 38) * CAMPUS_XZ_SCALE;
+      const camY = (24.5 + Math.sin(t * 1.2) * 2.5) * CAMPUS_Y_SCALE;
       this.camera.position.set(camX, camY, camZ);
-      this.camera.lookAt(-12, 8.5, 12);
+      this.camera.lookAt(-12 * CAMPUS_XZ_SCALE, 8.5 * CAMPUS_Y_SCALE, 12 * CAMPUS_XZ_SCALE);
       return;
     }
 
@@ -1150,6 +1267,35 @@ export class CampusSimulation {
 
     // Animated PBR water wave glints (Pasig River, Lagoon pond, Swimming Pool)
     this.world.waterTimeUniform.value = this.elapsed;
+
+    // Animated Pasig River (Ilog Pasig) vessels: MMDA Ferry catamaran & cargo barge
+    for (const boat of this.world.riverBoats) {
+      const nextZ = boat.group.position.z + boat.direction * boat.speed * dt;
+      if (nextZ > boat.maxZ) {
+        boat.group.position.z = boat.maxZ;
+        boat.direction = -1;
+      } else if (nextZ < boat.minZ) {
+        boat.group.position.z = boat.minZ;
+        boat.direction = 1;
+      } else {
+        boat.group.position.z = nextZ;
+      }
+      boat.group.position.x = boat.baseX + Math.sin(this.elapsed * 0.25 + boat.phase) * 0.45;
+      boat.group.position.y = -1.78 + Math.sin(this.elapsed * 1.9 + boat.phase) * 0.06;
+      boat.group.rotation.y = boat.direction === 1 ? 0 : Math.PI;
+      boat.group.rotation.z = Math.sin(this.elapsed * 1.4 + boat.phase) * 0.025;
+      boat.group.rotation.x = Math.cos(this.elapsed * 1.1 + boat.phase) * 0.015;
+    }
+
+    // Drifting Pasig River water hyacinth clusters (water lilies) floating downstream
+    for (const lily of this.world.riverLilies) {
+      let lz = lily.mesh.position.z + lily.speed * dt;
+      if (lz > 155) lz = -105;
+      lily.mesh.position.z = lz;
+      lily.mesh.position.x = lily.baseX + Math.sin(this.elapsed * 0.4 + lily.phase) * 0.7;
+      lily.mesh.position.y = -1.82 + Math.sin(this.elapsed * 2.1 + lily.phase) * 0.025;
+      lily.mesh.rotation.y += 0.14 * dt;
+    }
 
     // North Wing Tower Crane slow atmospheric wind sway
     this.world.craneJib.rotation.y = 0.45 + Math.sin(this.elapsed * 0.18) * 0.14;
@@ -1263,6 +1409,9 @@ export class CampusSimulation {
       prompt: this.currentPrompt,
       npcs: this.npcSystem.getNpcSnapshot(),
       activeWaypointId: this.activeWaypointId,
+      showColliders: this.showColliders,
+      colliderCount: this.world.colliders.length,
+      blockedByColliderIds: this.lastHitColliderIds,
     });
   }
 
@@ -1311,6 +1460,15 @@ export class CampusSimulation {
         this.world.colliders,
       );
       this.updateCamera(dt);
+      if (this.showColliders && this.colliderDebugOverlay) {
+        this.colliderDebugOverlay.update(
+          this.playerPos,
+          this.lastHitColliderIds,
+          this.lastContactNormalX,
+          this.lastContactNormalZ,
+          this.world.doors,
+        );
+      }
 
       const isIndoors = getSurfaceTypeAt(this.playerPos.x, this.playerPos.z) === 'interior';
       this.audio.updateSpatialAmbience(dt, this.playerPos.x, this.playerPos.z, isIndoors, this.weather, this.timeOfDay);
@@ -1349,6 +1507,7 @@ export class CampusSimulation {
     this.renderer.domElement.removeEventListener('dblclick', this.onDoubleClickCanvas);
     this.renderer.domElement.removeEventListener('wheel', this.onWheel);
 
+    this.colliderDebugOverlay?.dispose();
     this.world.dispose();
     this.npcSystem.dispose();
     this.textures.dispose();

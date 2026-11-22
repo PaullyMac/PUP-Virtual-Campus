@@ -2,19 +2,23 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   computeCampusDirections,
+  computeSafeCameraDistance,
   dampAngle,
   estimateRealWorldDistanceMeters,
   findNearestLandmark,
   findOverlappingFootprints,
+  getColliderDebugDescriptor,
   getCompassDirection,
   getNpcScheduleSlot,
   getSurfaceTypeAt,
   matchLandmarkFromQuery,
   resolveCircleAABBCollisions,
+  resolveCircleCollisionsWithNormal,
   stepHorizontalVelocity,
 } from './campusLogic';
 import { CAMPUS_LANDMARKS, CAMPUS_NPCS, PLAYER_SPAWN } from './campusData';
 import { computeGpsBearingDeg, haversineDistanceMeters, projectGpsToLocalMeters } from './geoProjection';
+import { createScaledAABB, createScaledOBB, scaleWorldX, scaleWorldZ } from './worldScale';
 
 test('compass directions match Three.js PUP campus axes (+X East, -X West, -Z North, +Z South)', () => {
   assert.equal(getCompassDirection({ x: 0, z: 0 }, { x: 20, z: 0 }), 'east');
@@ -142,12 +146,12 @@ test('query matcher resolves natural PUP landmark references', () => {
 });
 
 test('surface detection differentiates interior halls, grass turf, and outdoor concrete', () => {
-  assert.equal(getSurfaceTypeAt(-28, 24), 'interior'); // Main Building Central Dome
-  assert.equal(getSurfaceTypeAt(-24, -44), 'interior'); // NALLRC Library Reading Hall
-  assert.equal(getSurfaceTypeAt(-2, 42), 'interior'); // Interfaith Chapel Sanctuary
-  assert.equal(getSurfaceTypeAt(48, 44), 'grass'); // PUP Oval infield
-  assert.equal(getSurfaceTypeAt(39.5, 11.5), 'grass'); // Mabini Shrine compound lawn
-  assert.equal(getSurfaceTypeAt(70, -4), 'concrete'); // Main Gate boulevard
+  assert.equal(getSurfaceTypeAt(scaleWorldX(-28), scaleWorldZ(24)), 'interior'); // Main Building Central Dome
+  assert.equal(getSurfaceTypeAt(scaleWorldX(-24), scaleWorldZ(-44)), 'interior'); // NALLRC Library Reading Hall
+  assert.equal(getSurfaceTypeAt(scaleWorldX(-2), scaleWorldZ(42)), 'interior'); // Interfaith Chapel Sanctuary
+  assert.equal(getSurfaceTypeAt(scaleWorldX(48), scaleWorldZ(44)), 'grass'); // PUP Oval infield
+  assert.equal(getSurfaceTypeAt(scaleWorldX(39.5), scaleWorldZ(11.5)), 'grass'); // Mabini Shrine compound lawn
+  assert.equal(getSurfaceTypeAt(scaleWorldX(70), scaleWorldZ(-4)), 'concrete'); // Main Gate boulevard
 });
 
 test('all 40+ major PUP campus structures have zero overlapping footprints', () => {
@@ -176,16 +180,19 @@ test('newly audited official PUP Vicinity Map buildings are searchable and conne
   assert.ok(routeToSampaguita.totalDistanceMeters > 150);
 });
 
-test('South Anonas path to Maui Oasis, Futura Centro & El Pueblo Manila is searchable and routable from Main Gate', () => {
+test('South Anonas path to Barangay 630, Maui Oasis, Futura Centro & El Pueblo Manila is searchable and routable from Main Gate', () => {
   assert.equal(matchLandmarkFromQuery('How do I walk to Maui Oasis by Filinvest?')?.id, 'maui-el-pueblo');
   assert.equal(matchLandmarkFromQuery('Directions to El Pueblo Manila Condominium')?.id, 'maui-el-pueblo');
   assert.equal(matchLandmarkFromQuery('Where is Futura Centro along South Anonas?')?.id, 'maui-el-pueblo');
+  assert.equal(matchLandmarkFromQuery('Where is Barangay 630 Hall along South Anonas?')?.id, 'barangay-630-hall');
+  assert.equal(matchLandmarkFromQuery('Show me the Pasig River ilog at Linear Park')?.id, 'linear-park');
 
   const route = computeCampusDirections('main-gate', 'maui-el-pueblo');
   assert.equal(route.found, true);
   assert.equal(route.landmarks[0].id, 'main-gate');
   assert.equal(route.landmarks[route.landmarks.length - 1].id, 'maui-el-pueblo');
-  assert.ok(route.totalDistanceMeters >= 150 && route.totalDistanceMeters <= 320);
+  assert.ok(route.landmarks.some((l) => l.id === 'barangay-630-hall'));
+  assert.ok(route.totalDistanceMeters >= 280 && route.totalDistanceMeters <= 520, `expected long walk >= 280m, got ${route.totalDistanceMeters}m`);
 });
 
 test('Frutiger Aero procedural soundtrack progression, sparkle arpeggio & atmosphere profile are deterministic', async () => {
@@ -266,29 +273,44 @@ test('PUP Main Entrance forecourt curved sidewalks, tangent curbstones, Pylon po
   assert.ok(bays2.every((b) => b.width > 2.4 && b.width < 4.4));
 });
 
-test('Barangay 630 Zone 63 Hall & Maui Oasis corridor geometry are non-overlapping and accurately transformed', async () => {
+test('Barangay 630 Zone 63 Hall & far-south Maui Oasis corridor geometry are non-overlapping and authentically separated from PUP Oval', async () => {
   const {
     MAUI_CORRIDOR_CONFIG,
     computeBarangay630Footprints,
+    computeWestAnonasFootprints,
     computeBoulevardWorldPoint,
     computeMauiCorridorPoles,
     computeMauiSpeedHumps,
   } = await import('./mauiCorridorGeometry');
 
-  // Barangay 630 Hall is searchable in campus assistant
-  assert.equal(matchLandmarkFromQuery('Where is Barangay 630 Zone 63 Hall near Maui Oasis?')?.id, 'maui-el-pueblo');
+  // Barangay 630 Hall resolves to its dedicated landmark
+  assert.equal(matchLandmarkFromQuery('Where is Barangay 630 Zone 63 Hall?')?.id, 'barangay-630-hall');
 
-  // East Anonas civic/commercial buildings sit east of roadway curb with zero pairwise overlap
-  const fps = computeBarangay630Footprints();
-  assert.equal(fps.length, 3);
-  assert.ok(fps.some((f) => f.id === 'barangay-630-hall'));
-  for (const fp of fps) {
+  // Maui Oasis & El Pueblo are genuinely far south of PUP Oval wall (>= 120m real-world separation!)
+  const ovalToMauiMeters = (MAUI_CORRIDOR_CONFIG.mauiOasisMainZ - MAUI_CORRIDOR_CONFIG.pupOvalWallEndZ) * 1.62;
+  const ovalToElPuebloMeters = (MAUI_CORRIDOR_CONFIG.elPuebloMainZ - MAUI_CORRIDOR_CONFIG.pupOvalWallEndZ) * 1.62;
+  assert.ok(ovalToMauiMeters >= 130, `expected Maui Oasis >= 130m south of PUP Oval, got ${ovalToMauiMeters}m`);
+  assert.ok(ovalToElPuebloMeters >= 190, `expected El Pueblo >= 190m south of PUP Oval, got ${ovalToElPuebloMeters}m`);
+
+  // East & West South Anonas civic/commercial buildings sit clear of roadway curbs with zero pairwise overlap
+  const eastFps = computeBarangay630Footprints();
+  const westFps = computeWestAnonasFootprints();
+  assert.equal(eastFps.length, 9);
+  assert.equal(westFps.length, 4);
+  assert.ok(eastFps.some((f) => f.id === 'barangay-630-hall'));
+  assert.ok(eastFps.some((f) => f.id === 'barangay-630-health'));
+  for (const fp of eastFps) {
     assert.ok(fp.x - fp.width / 2 >= MAUI_CORRIDOR_CONFIG.anonasEastCurbX + 1.5, `${fp.id} encroaches on Anonas St`);
+    assert.ok(fp.z - fp.depth / 2 >= 69.5, `${fp.id} overlaps PNR/NLEX viaduct north of z=70`);
   }
-  for (let i = 0; i < fps.length; i++) {
-    for (let j = i + 1; j < fps.length; j++) {
-      const a = fps[i];
-      const b = fps[j];
+  for (const fp of westFps) {
+    assert.ok(fp.x + fp.width / 2 <= MAUI_CORRIDOR_CONFIG.anonasWestCurbX - 2.0, `${fp.id} encroaches on Anonas St`);
+  }
+  const allFps = [...eastFps, ...westFps];
+  for (let i = 0; i < allFps.length; i++) {
+    for (let j = i + 1; j < allFps.length; j++) {
+      const a = allFps[i];
+      const b = allFps[j];
       const overlapX = Math.abs(a.x - b.x) < (a.width + b.width) / 2;
       const overlapZ = Math.abs(a.z - b.z) < (a.depth + b.depth) / 2;
       assert.equal(overlapX && overlapZ, false, `Overlap between ${a.id} and ${b.id}`);
@@ -301,12 +323,122 @@ test('Barangay 630 Zone 63 Hall & Maui Oasis corridor geometry are non-overlappi
   assert.ok(Math.abs(Math.hypot(p1.x - p0.x, p1.z - p0.z) - 10) < 1e-6);
   assert.ok(p1.x > p0.x && p1.z < p0.z);
 
-  // Poles & speed humps populate both Anonas St and Maui Oasis boulevard
+  // Poles & speed humps populate both extended South Anonas St and far-south Maui Oasis boulevard
   const poles = computeMauiCorridorPoles();
   const humps = computeMauiSpeedHumps();
-  assert.equal(poles.length, 8);
-  assert.equal(humps.length, 4);
+  assert.equal(poles.length, 14);
+  assert.equal(humps.length, 7);
 });
+
+test('solid wall physics stops head-on motion cleanly, prevents thin-wall tunneling, and slides smoothly along rotated OBB walls', () => {
+  // 1) Head-on walk into a thin 0.4m concrete wall: player must stop outside & lose inward velocity
+  const thinWall = [{ id: 'thin-wall', minX: 10.0, maxX: 10.4, minZ: -10, maxZ: 10 }];
+  const headOn = resolveCircleCollisionsWithNormal(9.2, 0, 10.2, 0, 5.4, 0, 0.5, thinWall);
+  assert.equal(headOn.collided, true);
+  assert.ok(headOn.x <= 9.5001, `expected player stopped outside wall (x <= 9.5), got ${headOn.x}`);
+  assert.ok(headOn.vx <= 0.001, `expected inward vx cancelled to 0, got ${headOn.vx}`);
+
+  // 2) Anti-tunneling: huge single-frame 3.0m leap across a thin 0.4m wall must STILL stop on the near side (x <= 9.5)!
+  const leap = resolveCircleCollisionsWithNormal(9.0, 0, 12.0, 0, 15.0, 0, 0.5, thinWall);
+  assert.equal(leap.collided, true);
+  assert.ok(leap.x <= 9.5001, `expected anti-tunneling stop on near side (x <= 9.5), got ${leap.x}`);
+  assert.equal(leap.vx, 0);
+
+  // 3) Diagonal walk into a rotated Maui Oasis vine wall OBB (rotY = 0.26) blocks inward motion while sliding tangentially
+  const rotY = 0.26;
+  const obbWall = [createScaledOBB('vine-wall-test', 60, 95, 20, 0.85, rotY)];
+  const wCx = scaleWorldX(60);
+  const wCz = scaleWorldZ(95);
+  // Start 1.5m south of rotated wall center along wall's outward normal (+localZ -> world (+sin, +cos))
+  const nx = Math.sin(rotY);
+  const nz = Math.cos(rotY);
+  const startX = wCx + nx * 1.6;
+  const startZ = wCz + nz * 1.6;
+  // Walk diagonally into the wall (-normal + tangent)
+  const tx = Math.cos(rotY);
+  const tz = -Math.sin(rotY);
+  const vx = -nx * 4.0 + tx * 3.0;
+  const vz = -nz * 4.0 + tz * 3.0;
+  const obbRes = resolveCircleCollisionsWithNormal(startX, startZ, startX + vx * 0.5, startZ + vz * 0.5, vx, vz, 0.5, obbWall);
+  assert.equal(obbRes.collided, true);
+  // Verify signed distance along outward normal stays >= halfDepth + radius
+  const signedOutwardDist = (obbRes.x - wCx) * nx + (obbRes.z - wCz) * nz;
+  const minClearance = (0.85 * 1.62) / 2 + 0.5 - 0.01;
+  assert.ok(signedOutwardDist >= minClearance, `expected OBB clearance >= ${minClearance}, got ${signedOutwardDist}`);
+  // Verify tangential slide progressed along the wall
+  const tangDisp = (obbRes.x - startX) * tx + (obbRes.z - startZ) * tz;
+  assert.ok(tangDisp > 0.5, `expected smooth tangential slide > 0.5m, got ${tangDisp}`);
+});
+
+test('computeSafeCameraDistance pulls third-person camera cleanly below 2.1m down to 0.55m near AABB & OBB walls', () => {
+  const wallBehind = [createScaledAABB('behind-wall', 10, 0, 1.0, 20.0)];
+  const wallMaxX = wallBehind[0].maxX;
+  // Player stands 1.1m east of wall facing east (camera boom reaches west into wall!)
+  const safeDist = computeSafeCameraDistance(wallMaxX + 1.1, 0, 1, 0, 5.2, wallBehind, 0.55, 0.42);
+  assert.ok(safeDist >= 0.55 && safeDist < 1.2, `expected tight safe camera pull-in in [0.55..1.2], got ${safeDist}`);
+});
+
+test('true 1:1 Google Maps world-space scale & query aliases match real Sta. Mesa landmark distances', () => {
+  const gate = CAMPUS_LANDMARKS.find((l) => l.id === 'main-gate')!;
+  const obelisk = CAMPUS_LANDMARKS.find((l) => l.id === 'obelisk-freedom-park')!;
+  const stopShop = CAMPUS_LANDMARKS.find((l) => l.id === 'old-stamesa-stopshop')!;
+
+  // True 1:1 Google Maps world-space Euclidean spans (no longer compressed to 60%!)
+  const gateToStopShopWorldUnits = Math.hypot(stopShop.position.x - gate.position.x, stopShop.position.z - gate.position.z);
+  assert.ok(
+    gateToStopShopWorldUnits >= 185 && gateToStopShopWorldUnits <= 230,
+    `expected ~207 world units (~1:1 meters) from Main Gate to Old Sta. Mesa, got ${gateToStopShopWorldUnits}`,
+  );
+  const gateToObeliskWorldUnits = Math.hypot(obelisk.position.x - gate.position.x, obelisk.position.z - gate.position.z);
+  assert.ok(
+    gateToObeliskWorldUnits >= 100 && gateToObeliskWorldUnits <= 135,
+    `expected ~115 world units from Main Gate to Obelisk, got ${gateToObeliskWorldUnits}`,
+  );
+
+  // Query aliases for Tahanan ng Atleta ("Araneta Hall"), Barangay 630 Hall, and PUP Side Gate
+  assert.equal(matchLandmarkFromQuery('Where is Araneta Hall?')?.id, 'tahanan-ng-atleta');
+  assert.equal(matchLandmarkFromQuery('Where is Barangay 630 Hall?')?.id, 'barangay-630-hall');
+  assert.equal(matchLandmarkFromQuery('Take me to the PUP side gate')?.id, 'visitors-lounge-courts');
+});
+
+test('getColliderDebugDescriptor & hitColliderIds match AABB, rotated OBB, and closed-door physics 1:1', () => {
+  const aabb = createScaledAABB('test-aabb-wall', 20, -10, 4.0, 2.0);
+  const aabbDesc = getColliderDebugDescriptor(aabb);
+  assert.equal(aabbDesc.isOBB, false);
+  assert.ok(Math.abs(aabbDesc.cx - scaleWorldX(20)) < 1e-6);
+  assert.ok(Math.abs(aabbDesc.cz - scaleWorldZ(-10)) < 1e-6);
+  assert.ok(Math.abs(aabbDesc.width - 4.0 * 1.62) < 1e-6);
+  assert.ok(Math.abs(aabbDesc.depth - 2.0 * 1.62) < 1e-6);
+
+  const chapelRot = Math.PI / 4;
+  const obb = createScaledOBB('chapel-wall-1', -8.9, 35.1, 8.4, 1.45, chapelRot);
+  const obbDesc = getColliderDebugDescriptor(obb);
+  assert.equal(obbDesc.isOBB, true);
+  assert.equal(obbDesc.rotY, chapelRot);
+  assert.ok(Math.abs(obbDesc.width - 8.4 * 1.62) < 1e-6);
+  assert.ok(Math.abs(obbDesc.depth - 1.45 * 1.62) < 1e-6);
+
+  // Walking straight into a closed interactive door OBB reports its exact collider ID and blocks passage
+  const closedDoor = createScaledOBB('door-chapel-closed', -2, 32.2, 3.85, 0.55, 0);
+  const doorZ = scaleWorldZ(32.2);
+  const doorX = scaleWorldX(-2);
+  const blocked = resolveCircleCollisionsWithNormal(
+    doorX,
+    doorZ - 1.2,
+    doorX,
+    doorZ + 1.0,
+    0,
+    5.4,
+    0.5,
+    [closedDoor],
+  );
+  assert.equal(blocked.collided, true);
+  assert.deepEqual(blocked.hitColliderIds, ['door-chapel-closed']);
+  assert.ok(blocked.z < doorZ - 0.5, `expected closed door to stop player before doorway, got z=${blocked.z} vs doorZ=${doorZ}`);
+  assert.equal(blocked.vz, 0);
+});
+
+
 
 
 

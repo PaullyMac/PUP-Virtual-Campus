@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { AABB, CAMPUS_NPCS, NpcProfile, TimeOfDayPreset, Vec2 } from '../campus/campusData';
 import { getNpcScheduleSlot, resolveCircleAABBCollisions } from '../campus/campusLogic';
+import { scaleWorldPoint } from '../campus/worldScale';
 
 export interface ArticulatedHuman {
   root: THREE.Group;
@@ -303,7 +304,7 @@ function createNpcLabelSprite(name: string, roleCategory: string): THREE.Sprite 
   return sprite;
 }
 
-const AMBIENT_PATH_LOOPS: Vec2[][] = [
+const RAW_AMBIENT_PATH_LOOPS: Vec2[][] = [
   // Main Boulevard & Catwalk -> Obelisk Ring -> Freedom Park -> Mabini Shrine walk
   [
     { x: 64, z: -9.5 },
@@ -354,6 +355,10 @@ const AMBIENT_PATH_LOOPS: Vec2[][] = [
     { x: 44, z: 52 },
   ],
 ];
+
+const AMBIENT_PATH_LOOPS: Vec2[][] = RAW_AMBIENT_PATH_LOOPS.map((loop) =>
+  loop.map((pt) => scaleWorldPoint(pt)),
+);
 
 const AMBIENT_TOP_COLORS = ['#7b1113', '#f0ece3', '#2e4c73', '#d99b1e', '#3c6e57', '#4a4a52', '#8e2d31'];
 const AMBIENT_SKIN_TONES = ['#d8a684', '#c78f68', '#b87d56', '#e0b494'];

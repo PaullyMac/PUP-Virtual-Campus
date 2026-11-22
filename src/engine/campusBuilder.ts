@@ -8,13 +8,17 @@ import {
   generateCurvedSidewalkPolygon,
   PUP_FORECOURT_CONFIG,
 } from '../campus/entranceGeometry';
+import { buildMauiCorridor } from './mauiCorridorBuilder';
 import {
-  computeBarangay630Footprints,
-  computeBoulevardWorldPoint,
-  computeMauiCorridorPoles,
-  computeMauiSpeedHumps,
-  MAUI_CORRIDOR_CONFIG,
-} from '../campus/mauiCorridorGeometry';
+  CAMPUS_XZ_SCALE,
+  CAMPUS_Y_SCALE,
+  createScaledAABB,
+  createScaledOBB,
+  scaleWorldX,
+  scaleWorldY,
+  scaleWorldZ,
+  SIGN_ASPECT_COMPENSATION,
+} from '../campus/worldScale';
 import { CampusTextureSet, clearSignTextureCache, createSignTexture } from './textures';
 
 export interface InteractiveDoor {
@@ -26,6 +30,7 @@ export interface InteractiveDoor {
   isOpen: boolean;
   openProgress: number;
   colliderIds: string[];
+  closedCollider: AABB;
 }
 
 export interface InteractiveBench {
@@ -54,6 +59,22 @@ export interface BuiltCampusWorld {
   craneJib: THREE.Group;
   waterMeshes: THREE.Mesh[];
   waterTimeUniform: { value: number };
+  riverBoats: Array<{
+    group: THREE.Group;
+    baseX: number;
+    minZ: number;
+    maxZ: number;
+    speed: number;
+    phase: number;
+    direction: 1 | -1;
+  }>;
+  riverLilies: Array<{
+    mesh: THREE.Object3D;
+    baseX: number;
+    baseZ: number;
+    speed: number;
+    phase: number;
+  }>;
   perfStats: {
     originalStaticMeshes: number;
     mergedStaticBatches: number;
@@ -66,9 +87,16 @@ export function buildPupCampusWorld(
   textures: CampusTextureSet,
   castShadow: boolean,
 ): BuiltCampusWorld {
+  const worldRoot = new THREE.Group();
+  worldRoot.name = 'PUP_Sta_Mesa_Campus';
+  scene.add(worldRoot);
+
+  // Blueprint-scaled subroot: expands 3D campus to true 1:1 Google Maps real-world meters
+  // while preserving every architectural seam and keeping human avatars at true 1.72m scale!
   const root = new THREE.Group();
-  root.name = 'PUP_Sta_Mesa_Campus';
-  scene.add(root);
+  root.name = 'PUP_Sta_Mesa_Blueprint_Scaled';
+  root.scale.set(CAMPUS_XZ_SCALE, CAMPUS_Y_SCALE, CAMPUS_XZ_SCALE);
+  worldRoot.add(root);
 
   const colliders: AABB[] = [];
   const doors: InteractiveDoor[] = [];
@@ -79,6 +107,8 @@ export function buildPupCampusWorld(
   const emissiveWindowMats: THREE.MeshStandardMaterial[] = [];
   const animatedFlags: THREE.Mesh[] = [];
   const waterMeshes: THREE.Mesh[] = [];
+  const riverBoats: BuiltCampusWorld['riverBoats'] = [];
+  const riverLilies: BuiltCampusWorld['riverLilies'] = [];
   const ownedGeometries: THREE.BufferGeometry[] = [];
   const ownedMaterials: THREE.Material[] = [];
   const ownedTextures: THREE.Texture[] = [];
@@ -400,27 +430,29 @@ export function buildPupCampusWorld(
         .replace(
           '#include <color_fragment>',
           `#include <color_fragment>
-          float w1 = sin(vWaterWorldPos.x * uRippleScale + uTime * 1.45) * cos(vWaterWorldPos.z * uRippleScale * 0.85 - uTime * 1.1);
-          float w2 = sin((vWaterWorldPos.x + vWaterWorldPos.z) * uRippleScale * 1.6 - uTime * 1.9);
-          float glint = smoothstep(0.58, 0.96, 0.5 + 0.35 * w1 + 0.25 * w2);
-          diffuseColor.rgb = mix(diffuseColor.rgb * 0.88, diffuseColor.rgb * 1.18 + vec3(0.12, 0.17, 0.19), 0.5 + 0.32 * w1 + glint * 0.32);`,
+          float flowZ = vWaterWorldPos.z - uTime * 2.1;
+          float w1 = sin(vWaterWorldPos.x * uRippleScale * 1.15 + uTime * 1.2) * cos(flowZ * uRippleScale * 0.9);
+          float w2 = sin((vWaterWorldPos.x * 0.8 + flowZ) * uRippleScale * 1.85 - uTime * 1.4);
+          float glint = smoothstep(0.54, 0.94, 0.5 + 0.36 * w1 + 0.28 * w2);
+          float shoreFoam = smoothstep(4.2, 0.0, abs(vWaterWorldPos.x - (-76.5 * 1.62))) * (0.45 + 0.55 * sin(flowZ * 0.8 + uTime * 2.5));
+          vec3 waterTint = mix(diffuseColor.rgb * 0.78, diffuseColor.rgb * 1.26 + vec3(0.16, 0.24, 0.28), 0.5 + 0.34 * w1 + glint * 0.36);
+          diffuseColor.rgb = mix(waterTint, vec3(0.84, 0.93, 0.96), clamp(shoreFoam * 0.52, 0.0, 0.55));`,
         );
     };
     return trackMat(mat);
   }
 
-  const matPasigWater = createAnimatedWaterMaterial(0x285f6e, 0.32);
+  const matPasigWater = createAnimatedWaterMaterial(0x1f6b82, 0.28);
   const matLagoonWater = createAnimatedWaterMaterial(0x2b7a78, 0.65);
   const matPoolWater = createAnimatedWaterMaterial(0x2692c8, 0.95);
 
+  let autoColliderIdx = 0;
   function addCollider(id: string, cx: number, cz: number, w: number, d: number) {
-    colliders.push({
-      id,
-      minX: cx - w / 2,
-      maxX: cx + w / 2,
-      minZ: cz - d / 2,
-      maxZ: cz + d / 2,
-    });
+    colliders.push(createScaledAABB(id, cx, cz, w, d));
+  }
+
+  function addOBBCollider(id: string, cx: number, cz: number, w: number, d: number, rotY: number) {
+    colliders.push(createScaledOBB(id, cx, cz, w, d, rotY));
   }
 
   const unitBoxGeo = trackGeo(new THREE.BoxGeometry(1, 1, 1));
@@ -486,7 +518,8 @@ export function buildPupCampusWorld(
       signMatCache.set(matKey, mat);
     }
     const mesh = new THREE.Mesh(unitPlaneGeo, mat);
-    mesh.scale.set(w, h, 1);
+    // Compensate local width so root.scale (XZ=1.62, Y=1.18) preserves crisp 1:1 text aspect ratio
+    mesh.scale.set(w * SIGN_ASPECT_COMPENSATION, h, 1);
     mesh.position.set(x, y, z);
     mesh.rotation.y = rotY;
     parent.add(mesh);
@@ -535,105 +568,189 @@ export function buildPupCampusWorld(
     const door: InteractiveDoor = {
       id,
       label,
-      position: new THREE.Vector3(x, 1.5, z),
+      position: new THREE.Vector3(scaleWorldX(x), scaleWorldY(1.5), scaleWorldZ(z)),
       leftPivot,
       rightPivot,
       isOpen: startOpen,
       openProgress: initialProg,
       colliderIds: [],
+      closedCollider: createScaledOBB(`${id}-closed`, x, z, 3.85, 0.55, rotY),
     };
     doors.push(door);
     return door;
   }
 
   // =========================================================================
-  // 1. TERRAIN, PASIG RIVER, LINEAR PARK, ROADS & REAL PUP STA. MESA PLAZAS
+  // 1. TERRAIN, SUNKEN PASIG RIVER (ILOG PASIG), LINEAR PARK & PUP FERRY STATION
   // =========================================================================
-  const ground = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(540, 540)), matGrass);
+  // Main grass terrain starts cleanly at the Pasig River concrete seawall (x = -76.5)
+  // and extends far south to z = +340 for the full Barangay 630 / Maui Oasis / El Pueblo corridor.
+  const ground = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(460, 560)), matGrass);
   ground.rotation.x = -Math.PI / 2;
-  ground.position.y = 0;
+  ground.position.set(153.5, 0, 80);
   ground.receiveShadow = true;
   root.add(ground);
 
-  // Pasig River running along the western campus boundary (x = -76..-225)
-  const river = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(150, 540)), matPasigWater);
+  // Deep riverbed floor under the Pasig River (prevents any void or grass bleed)
+  const matRiverBed = trackMat(new THREE.MeshStandardMaterial({ color: 0x0e2932, roughness: 0.96 }));
+  const riverBed = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(140, 620)), matRiverBed);
+  riverBed.rotation.x = -Math.PI / 2;
+  riverBed.position.set(-146, -3.5, 70);
+  root.add(riverBed);
+
+  // Sunken, wide, flowing Pasig River (Ilog Pasig) channel along PUP Linear Park (x = -76.2 .. -154.0, y = -1.85)
+  const river = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(82, 620)), matPasigWater);
   river.rotation.x = -Math.PI / 2;
-  river.position.set(-151, 0.03, 0);
+  river.position.set(-116.5, -1.85, 70);
   river.receiveShadow = true;
   root.add(river);
   waterMeshes.push(river);
 
-  // Concrete river seawall & Linear Park promenade along western edge (x = -76..-63)
-  addBox(root, 1.4, 1.6, 176, -76.5, 0.45, 0, matConcrete, false);
-  const linearWalk = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(12, 146)), matPaver);
+  // Translucent white shoreline ripple/foam strips hugging PUP's seawall and the opposite Pandacan bank
+  const matRiverFoam = trackMat(
+    new THREE.MeshStandardMaterial({
+      color: 0xdff2f7,
+      roughness: 0.35,
+      transparent: true,
+      opacity: 0.45,
+      depthWrite: false,
+    }),
+  );
+  const eastFoam = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(1.1, 260)), matRiverFoam);
+  eastFoam.rotation.x = -Math.PI / 2;
+  eastFoam.position.set(-77.4, -1.82, 10);
+  root.add(eastFoam);
+  const westFoam = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(1.3, 260)), matRiverFoam);
+  westFoam.rotation.x = -Math.PI / 2;
+  westFoam.position.set(-153.2, -1.82, 10);
+  root.add(westFoam);
+
+  // Vertical weathered concrete Pasig River seawall & tide-stained embankment dropping down into the water (x = -76.5)
+  const matTideMoss = trackMat(new THREE.MeshStandardMaterial({ color: 0x2c4236, roughness: 0.94 }));
+  const matRiverWall = trackMat(new THREE.MeshStandardMaterial({ color: 0x9b968d, roughness: 0.92 }));
+  addBox(root, 1.5, 3.65, 220, -76.5, -1.35, 10, matRiverWall, false);
+  // Dark wet-tide algae/waterline stripe kissing the Pasig River surface
+  addBox(root, 1.56, 0.72, 220, -76.5, -1.62, 10, matTideMoss, false);
+  // Seawall vertical concrete buttress ribs, drainage outfalls & cast-iron mooring bollards
+  for (let rz = -74; rz <= 82; rz += 9.5) {
+    addBox(root, 0.45, 3.4, 0.55, -77.3, -1.35, rz, matRawConcrete, false);
+    const outfall = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.18, 0.18, 0.65, 8)), matDarkSteel);
+    outfall.rotation.z = Math.PI / 2;
+    outfall.position.set(-77.45, -1.05, rz + 4.5);
+    root.add(outfall);
+  }
+
+  // PUP Linear Park riverside promenade walkway (x = -75.8 .. -63.0)
+  const linearWalk = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(12.8, 152)), matPaver);
   linearWalk.rotation.x = -Math.PI / 2;
   linearWalk.position.set(-69.5, 0.04, 2);
   linearWalk.receiveShadow = true;
   root.add(linearWalk);
 
-  for (let z = -66; z <= 66; z += 5.5) {
-    addBox(root, 0.24, 1.05, 0.24, -75.6, 0.55, z, matBrightWhite, false);
+  // Low riverside concrete curb (0.42m) + open forest-green steel railings (unobstructed view down into Ilog Pasig!)
+  const matLinearGreen = trackMat(new THREE.MeshStandardMaterial({ color: 0x1f6240, roughness: 0.55, metalness: 0.35 }));
+  addBox(root, 0.58, 0.44, 138, -75.7, 0.22, 0, matRawConcrete, false);
+  for (let z = -66; z <= 66; z += 6.6) {
+    if (z > 48 && z < 64) continue; // Keep Ferry Station gangway entry open!
+    addBox(root, 0.26, 1.18, 0.26, -75.65, 0.59, z, matBrightWhite, false);
   }
-  // Linear Park signature continuous concrete riverside bench/ledge + forest-green steel railings (linear_park.jpg!)
-  const matLinearGreen = trackMat(new THREE.MeshStandardMaterial({ color: 0x225a3c, roughness: 0.58, metalness: 0.35 }));
-  addBox(root, 0.72, 0.52, 134, -74.9, 0.26, 0, matRawConcrete, false);
-  addBox(root, 0.14, 0.12, 134, -75.6, 1.18, 0, matLinearGreen, false);
-  addBox(root, 0.12, 0.08, 134, -75.6, 0.76, 0, matLinearGreen, false);
-  for (let lz = -64; lz <= 64; lz += 2.2) {
-    addBox(root, 0.07, 0.7, 0.07, -75.6, 0.85, lz, matLinearGreen, false);
+  // Open green horizontal safety rails + vertical slim balusters (split around Ferry Station gangway z = 50..62)
+  for (const [segZ, segLen] of [
+    [-9.5, 118.0],
+    [70.0, 14.0],
+  ] as Array<[number, number]>) {
+    addBox(root, 0.09, 0.09, segLen, -75.65, 1.16, segZ, matLinearGreen, false);
+    addBox(root, 0.07, 0.06, segLen, -75.65, 0.78, segZ, matLinearGreen, false);
+  }
+  for (let lz = -66; lz <= 76; lz += 2.2) {
+    if (lz > 49.5 && lz < 62.5) continue;
+    addBox(root, 0.05, 0.74, 0.05, -75.65, 0.79, lz, matLinearGreen, false);
   }
 
-  // PUP Pasig River Ferry Station pier at SW corner (-75, 56) — photo-matched to ferry.jpg & pup_ferry_wiki.jpg!
+  // Linear Park riverfront signage plaque ("PUP LINEAR PARK · ILOG PASIG") + brick planter beds
+  const matBougainvillea = trackMat(new THREE.MeshStandardMaterial({ color: 0xc92c6d, roughness: 0.75 }));
+  const matRiverFoliage = trackMat(new THREE.MeshStandardMaterial({ color: 0x2d6b34, roughness: 0.86 }));
+  for (const pz of [-42, -22, -4, 18, 36]) {
+    addBox(root, 1.6, 0.44, 4.4, -64.0, 0.22, pz, matLagoonBrick, false);
+    addBox(root, 1.32, 0.34, 4.0, -64.0, 0.5, pz, matRiverFoliage, false);
+    addBox(root, 0.7, 0.26, 1.4, -64.0, 0.72, pz + 0.6, matBougainvillea, false);
+  }
+  addBox(root, 0.14, 1.92, 0.14, -74.55, 0.96, 11.82, matDarkSteel, false);
+  addBox(root, 0.14, 1.92, 0.14, -74.55, 0.96, 14.18, matDarkSteel, false);
+  addSignMesh(root, 3.2, 0.95, -74.48, 1.42, 13.0, Math.PI / 2, 'PUP LINEAR PARK', 'ILOG PASIG · RIVERFRONT PROMENADE', {
+    bg: '#184d37',
+    border: '#e5c16c',
+    titleColor: '#ffffff',
+    subtitleColor: '#e8dfbe',
+  });
+
+  // Solid Pasig River seawall barrier (prevents walking off Linear Park into the Pasig River, leaving SW Ferry gangway open)
+  addCollider('pasig-seawall-north', -76.0, -10.5, 2.2, 118.0);
+  addCollider('pasig-seawall-south', -76.0, 72.0, 2.2, 16.0);
+
+  // PUP Pasig River Ferry Station pier at SW corner (-75, 56) — floating pontoon right on the Pasig River water (y = -1.85)!
   const ferryGroup = new THREE.Group();
   ferryGroup.position.set(-75, 0, 56);
   const matFerrySteel = trackMat(new THREE.MeshStandardMaterial({ color: 0x566069, roughness: 0.52, metalness: 0.48 }));
   const matTireRubber = trackMat(new THREE.MeshStandardMaterial({ color: 0x1a1c1e, roughness: 0.92 }));
-  // Floating concrete pontoon dock & mooring piers
-  addBox(ferryGroup, 9.5, 0.72, 15.0, -3.5, 0.36, 0, matRawConcrete, false);
+  // Floating concrete pontoon dock sitting right at Pasig River water level (y = -1.55)
+  addBox(ferryGroup, 9.2, 0.85, 15.0, -6.2, -1.55, 0, matRawConcrete, false);
+  // Sloped metal boarding gangway ramp descending from Linear Park seawall (x = -0.8, y = 0.08) to pontoon (x = -2.8, y = -1.18)
+  const gangway = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(3.2, 0.16, 3.6)), matFerrySteel);
+  gangway.position.set(-1.6, -0.58, 0);
+  gangway.rotation.z = 0.42;
+  ferryGroup.add(gangway);
+  for (const gz of [-1.75, 1.75]) {
+    const gRail = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(3.2, 0.08, 0.08)), matSilverSteel);
+    gRail.position.set(-1.6, 0.22, gz);
+    gRail.rotation.z = 0.42;
+    ferryGroup.add(gRail);
+  }
   for (const dz of [-6.2, -2.0, 2.0, 6.2]) {
-    addBox(ferryGroup, 0.72, 2.6, 0.72, -7.8, 1.3, dz, matBrightWhite, false);
-    addBox(ferryGroup, 0.72, 2.6, 0.72, 0.6, 1.3, dz, matBrightWhite, false);
-    // Black rubber tire fenders bolted along the river edge (ferry.jpg!)
+    // Tall white mooring pilings rising from riverbed through pontoon to canopy
+    addBox(ferryGroup, 0.68, 5.1, 0.68, -10.4, -0.35, dz, matBrightWhite, false);
+    addBox(ferryGroup, 0.68, 5.1, 0.68, -2.0, -0.35, dz, matBrightWhite, false);
+    // Black rubber tire fenders bolted along the river edge kissing the Pasig River surface
     const tire = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(0.42, 0.14, 8, 14)), matTireRubber);
     tire.rotation.y = Math.PI / 2;
-    tire.position.set(-8.32, 0.35, dz);
+    tire.position.set(-10.92, -1.52, dz);
     ferryGroup.add(tire);
   }
-  // Curved arched steel-truss canopy over floating dock (ferry.jpg!)
+  // Curved arched steel-truss canopy over floating dock
   const ferryCanopy = new THREE.Mesh(
-    trackGeo(new THREE.CylinderGeometry(7.8, 7.8, 9.6, 16, 1, true, -Math.PI * 0.32, Math.PI * 0.64)),
+    trackGeo(new THREE.CylinderGeometry(7.8, 7.8, 9.4, 16, 1, true, -Math.PI * 0.32, Math.PI * 0.64)),
     matFerrySteel,
   );
   ferryCanopy.rotation.z = Math.PI / 2;
   ferryCanopy.scale.set(1, 0.24, 1);
-  ferryCanopy.position.set(-3.5, 2.3, 0);
+  ferryCanopy.position.set(-6.2, 0.95, 0);
   ferryGroup.add(ferryCanopy);
-  // Signature black-and-yellow diagonal hazard-striped I-beam girder (pup_ferry_wiki.jpg!)
-  addBox(ferryGroup, 0.35, 0.42, 14.6, -7.8, 3.45, 0, matGold, false);
+  // Signature black-and-yellow diagonal hazard-striped I-beam girder
+  addBox(ferryGroup, 0.35, 0.42, 14.6, -10.4, 2.1, 0, matGold, false);
   for (let hz = -6.8; hz <= 6.8; hz += 1.0) {
-    addBox(ferryGroup, 0.38, 0.43, 0.44, -7.8, 3.45, hz, matDarkSteel, false);
+    addBox(ferryGroup, 0.38, 0.43, 0.44, -10.4, 2.1, hz, matDarkSteel, false);
   }
   // Galvanized steel boarding railings & orange life ring
-  addBox(ferryGroup, 0.08, 0.95, 11.5, -7.4, 1.2, 0, matSilverSteel, false);
+  addBox(ferryGroup, 0.08, 0.95, 11.5, -10.0, -0.65, 0, matSilverSteel, false);
   const lifeRing = new THREE.Mesh(
     trackGeo(new THREE.TorusGeometry(0.32, 0.08, 8, 14)),
     trackMat(new THREE.MeshStandardMaterial({ color: 0xe05d1e, roughness: 0.5 })),
   );
   lifeRing.rotation.y = Math.PI / 2;
-  lifeRing.position.set(-7.2, 1.65, -3.5);
+  lifeRing.position.set(-9.8, -0.15, -3.5);
   ferryGroup.add(lifeRing);
-  // Emerald-green MMDA signboard ("P.U.P. PASIG RIVER FERRY STATION" — pup_ferry_wiki.jpg!)
-  addSignMesh(ferryGroup, 7.6, 1.25, -8.1, 3.05, 0, -Math.PI / 2, 'P.U.P. PASIG RIVER FERRY STATION', 'MMDA PASIG RIVER FERRY SERVICE', {
+  // Emerald-green MMDA signboard ("P.U.P. PASIG RIVER FERRY STATION")
+  addSignMesh(ferryGroup, 7.6, 1.25, -10.75, 1.65, 0, -Math.PI / 2, 'P.U.P. PASIG RIVER FERRY STATION', 'MMDA PASIG RIVER FERRY SERVICE', {
     bg: '#0c7c59',
     border: '#ffffff',
     titleColor: '#ffffff',
   });
-  addSignMesh(ferryGroup, 7.6, 1.25, 1.1, 3.05, 0, Math.PI / 2, 'P.U.P. PASIG RIVER FERRY STATION', 'MMDA PASIG RIVER FERRY SERVICE', {
+  addSignMesh(ferryGroup, 7.6, 1.25, -1.55, 1.65, 0, Math.PI / 2, 'P.U.P. PASIG RIVER FERRY STATION', 'MMDA PASIG RIVER FERRY SERVICE', {
     bg: '#0c7c59',
     border: '#ffffff',
     titleColor: '#ffffff',
   });
-  // White curved-roof terminal building behind dock with red "PUP STATION" lettering (ferry.jpg!)
+  // White curved-roof terminal building on Linear Park promenade behind dock with red "PUP STATION" lettering
   addBox(ferryGroup, 5.2, 4.2, 12.6, 3.8, 2.1, 0, matBrightWhite, false);
   addBox(ferryGroup, 5.4, 1.4, 9.8, 3.8, 2.8, 0, matGlass, false);
   const terminalRoof = new THREE.Mesh(
@@ -644,12 +761,160 @@ export function buildPupCampusWorld(
   terminalRoof.scale.set(1, 0.25, 1);
   terminalRoof.position.set(3.8, 3.1, 0);
   ferryGroup.add(terminalRoof);
-  addSignMesh(ferryGroup, 5.4, 0.85, 6.45, 3.85, 0, Math.PI / 2, 'PUP STATION', '', {
-    bg: '#f4f0e8',
-    border: 'none',
-    titleColor: '#b51c1f',
+  addSignMesh(ferryGroup, 7.6, 1.05, 6.46, 3.62, 0, Math.PI / 2, 'PUP FERRY STATION', 'MMDA PASIG RIVER FERRY SERVICE', {
+    bg: '#0c7c59',
+    border: '#f2c22e',
+    titleColor: '#ffffff',
+    subtitleColor: '#fde89b',
+  });
+  addSignMesh(ferryGroup, 5.1, 1.05, 3.8, 3.35, -6.36, Math.PI, 'PUP FERRY STATION', 'BOARDING GANGWAY →', {
+    bg: '#0c7c59',
+    border: '#f2c22e',
+    titleColor: '#ffffff',
+    subtitleColor: '#fde89b',
   });
   root.add(ferryGroup);
+  addCollider('pup-ferry-terminal', -71.2, 56.0, 5.4, 12.8);
+  addCollider('pup-ferry-seawall-gate', -76.2, 56.0, 1.2, 12.8);
+
+  // --- LIVING PASIG RIVER: MMDA FERRY CATAMARAN, PASSING BARGE, WATER HYACINTHS, PANDACAN BANK & MABINI BRIDGE! ---
+  const matFerryHull = trackMat(new THREE.MeshStandardMaterial({ color: 0xf4f6f8, roughness: 0.35 }));
+  const matFerryTeal = trackMat(new THREE.MeshStandardMaterial({ color: 0x0c7c59, roughness: 0.42 }));
+  const matFerryBlue = trackMat(new THREE.MeshStandardMaterial({ color: 0x1652a8, roughness: 0.42 }));
+  const matBargeRust = trackMat(new THREE.MeshStandardMaterial({ color: 0x6e3b2e, roughness: 0.82 }));
+  const matLilyLeaf = trackMat(new THREE.MeshStandardMaterial({ color: 0x3b7a38, roughness: 0.85 }));
+  const matLilyBloom = trackMat(new THREE.MeshStandardMaterial({ color: 0x9b72cf, roughness: 0.7 }));
+
+  // 1) Animated MMDA Pasig River Ferry Catamaran ("M/B PUP - ESCOLTA") cruising past Linear Park
+  const mmdaFerry = new THREE.Group();
+  mmdaFerry.position.set(-96, -1.68, 4);
+  // Twin catamaran pontoons + main deck
+  addBox(mmdaFerry, 1.0, 0.72, 13.5, -1.55, 0.18, 0, matFerryBlue, false);
+  addBox(mmdaFerry, 1.0, 0.72, 13.5, 1.55, 0.18, 0, matFerryBlue, false);
+  addBox(mmdaFerry, 4.2, 0.28, 12.6, 0, 0.55, 0, matFerryHull, false);
+  // Passenger cabin + wrap-around tinted glass windows + emerald MMDA roof stripe
+  addBox(mmdaFerry, 3.6, 1.65, 8.8, 0, 1.48, -0.4, matFerryHull, false);
+  addBox(mmdaFerry, 3.68, 0.78, 7.8, 0, 1.62, -0.3, matGlass, false);
+  addBox(mmdaFerry, 3.9, 0.22, 9.6, 0, 2.38, -0.4, matFerryTeal, false);
+  // Bow pilot wheelhouse + golden safety rails + stern trailing white foam wake
+  addBox(mmdaFerry, 2.4, 0.85, 2.2, 0, 1.65, 4.4, matFerryHull, false);
+  addBox(mmdaFerry, 2.46, 0.48, 1.5, 0, 1.72, 4.85, matGlass, false);
+  addBox(mmdaFerry, 4.1, 0.08, 0.08, 0, 1.12, 6.1, matGold, false);
+  const ferryWake = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(3.4, 14.0)), matRiverFoam);
+  ferryWake.rotation.x = -Math.PI / 2;
+  ferryWake.position.set(0, -0.1, -13.2);
+  mmdaFerry.add(ferryWake);
+  addSignMesh(mmdaFerry, 4.6, 0.56, 1.86, 1.1, -0.4, Math.PI / 2, 'MMDA PASIG FERRY', 'PUP · ESCOLTA · GUADALUPE', {
+    bg: '#0c7c59',
+    border: '#f2c22e',
+    titleColor: '#ffffff',
+    subtitleColor: '#fde89b',
+    width: 420,
+    height: 96,
+  });
+  root.add(mmdaFerry);
+  riverBoats.push({ group: mmdaFerry, baseX: -96, minZ: -86, maxZ: 92, speed: 3.4, phase: 0, direction: 1 });
+
+  // 2) Slow Cargo Barge & Tugboat gliding further west along the Pasig River channel
+  const riverBarge = new THREE.Group();
+  riverBarge.position.set(-125, -1.65, -24);
+  addBox(riverBarge, 6.2, 1.25, 20.0, 0, 0.32, 0, matBargeRust, false);
+  addBox(riverBarge, 5.4, 0.85, 16.0, 0, 0.72, 0, matRawConcrete, false);
+  // Small white tugboat cabin at rear
+  addBox(riverBarge, 3.4, 2.2, 4.2, 0, 1.45, -11.5, matBrightWhite, false);
+  addBox(riverBarge, 3.5, 0.75, 2.8, 0, 1.85, -11.2, matGlass, false);
+  addBox(riverBarge, 0.48, 1.8, 0.48, 0, 2.75, -12.6, matGold, false);
+  root.add(riverBarge);
+  riverBoats.push({ group: riverBarge, baseX: -125, minZ: -95, maxZ: 98, speed: 1.85, phase: 1.8, direction: -1 });
+
+  // 3) Drifting Water Hyacinth / Water Lily Clusters ("water lily" patches iconic to Ilog Pasig!)
+  const lilyGeo = trackGeo(new THREE.CylinderGeometry(0.95, 1.05, 0.14, 7));
+  const lilyCoords: Array<[number, number, number]> = [
+    [-83, -46, 1.2], [-86, -24, 1.0], [-81, -8, 1.35], [-88, 6, 1.1],
+    [-82, 19, 1.4], [-90, 32, 0.95], [-84, 44, 1.25], [-104, -36, 1.5],
+    [-108, -10, 1.2], [-102, 14, 1.3], [-112, 38, 1.15], [-138, -20, 1.4],
+    [-142, 10, 1.25], [-136, 46, 1.3],
+  ];
+  lilyCoords.forEach(([lx, lz, sc], idx) => {
+    const patch = new THREE.Group();
+    patch.position.set(lx, -1.8, lz);
+    const padA = new THREE.Mesh(lilyGeo, matLilyLeaf);
+    padA.scale.set(sc * 1.3, 1, sc);
+    patch.add(padA);
+    const padB = new THREE.Mesh(lilyGeo, matLilyLeaf);
+    padB.scale.set(sc * 0.9, 1.1, sc * 0.85);
+    padB.position.set(sc * 0.85, 0.02, sc * 0.45);
+    patch.add(padB);
+    const bloom = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.18, 6, 5)), matLilyBloom);
+    bloom.position.set(0.2, 0.16, -0.15);
+    patch.add(bloom);
+    root.add(patch);
+    riverLilies.push({ mesh: patch, baseX: lx, baseZ: lz, speed: 0.65 + (idx % 3) * 0.22, phase: idx * 0.9 });
+  });
+
+  // 4) AUTHENTIC OPPOSITE RIVERBANK (Pandacan / Sta. Mesa Far Shore at x = -154..-220) — replaces blank gray horizon cubes!
+  const pandacanBank = new THREE.Group();
+  root.add(pandacanBank);
+  // Opposite concrete river floodwall & grassy land deck
+  addBox(pandacanBank, 1.8, 3.8, 340, -154.5, -1.1, 20, matRiverWall, false);
+  addBox(pandacanBank, 1.86, 0.72, 340, -154.5, -1.62, 20, matTideMoss, false);
+  const pandacanGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(110, 360)), matGrass);
+  pandacanGround.rotation.x = -Math.PI / 2;
+  pandacanGround.position.set(-209.5, 0.75, 20);
+  pandacanBank.add(pandacanGround);
+  // Lush Pandacan riverside tree line
+  const pTrunkGeo = trackGeo(new THREE.CylinderGeometry(0.24, 0.34, 4.8, 6));
+  const pCrownGeo = trackGeo(new THREE.DodecahedronGeometry(3.2, 0));
+  for (let pz = -110; pz <= 130; pz += 14) {
+    const tr = new THREE.Mesh(pTrunkGeo, matWood);
+    tr.position.set(-158.5, 3.1, pz);
+    pandacanBank.add(tr);
+    const cr = new THREE.Mesh(pCrownGeo, matRiverFoliage);
+    cr.scale.set(1.25, 0.9, 1.35);
+    cr.position.set(-158.5, 6.4, pz);
+    pandacanBank.add(cr);
+  }
+  // Varied Pandacan Manila riverside buildings, roofs & residential blocks (warm urban silhouettes, zero blank monoliths!)
+  const pandacanWallColors = [0xd8cec0, 0xcab8a4, 0xc4ccd2, 0xd4c2a8, 0xbec7be];
+  const pandacanRoofColors = [0x82362a, 0x3b5878, 0x5c636b, 0x7a4b32, 0x2f5e48];
+  const pandacanBldgs: Array<[number, number, number, number, number]> = [
+    [-168, -96, 14, 11, 18],
+    [-174, -68, 16, 16, 22],
+    [-169, -40, 14, 10, 16],
+    [-178, -14, 18, 22, 20],
+    [-168, 12, 13, 12, 18],
+    [-176, 38, 17, 19, 22],
+    [-169, 64, 14, 11, 18],
+    [-178, 92, 18, 24, 20],
+    [-198, -76, 18, 28, 22],
+    [-202, -26, 20, 34, 24],
+    [-198, 24, 18, 26, 22],
+    [-204, 72, 20, 32, 24],
+  ];
+  pandacanBldgs.forEach(([bx, bz, bw, bh, bd], i) => {
+    const wMat = trackMat(new THREE.MeshStandardMaterial({ color: pandacanWallColors[i % pandacanWallColors.length], roughness: 0.86 }));
+    const rMat = trackMat(new THREE.MeshStandardMaterial({ color: pandacanRoofColors[i % pandacanRoofColors.length], roughness: 0.78 }));
+    addBox(pandacanBank, bw, bh, bd, bx, 0.75 + bh / 2, bz, wMat, false);
+    addBox(pandacanBank, bw + 0.8, 0.75, bd + 0.8, bx, 0.75 + bh + 0.36, bz, rMat, false);
+    for (let fy = 3.6; fy < bh - 1.5; fy += 3.2) {
+      addBox(pandacanBank, 0.18, 1.05, bd * 0.78, bx + bw / 2 + 0.04, 0.75 + fy, bz, matGlass, false);
+    }
+  });
+
+  // 5) Iconic Mabini (Nagtahan) Bridge spanning across the Pasig River on the north horizon (z = -124)
+  const bridgeGroup = new THREE.Group();
+  bridgeGroup.position.set(0, 0, -124);
+  addBox(bridgeGroup, 118, 1.8, 11.5, -116, 7.6, 0, matRawConcrete, false);
+  addBox(bridgeGroup, 118, 0.95, 0.35, -116, 8.95, 5.55, matBrightWhite, false);
+  addBox(bridgeGroup, 118, 0.95, 0.35, -116, 8.95, -5.55, matBrightWhite, false);
+  for (const pierX of [-152, -130, -104, -79]) {
+    addBox(bridgeGroup, 3.2, 11.2, 9.2, pierX, 1.8, 0, matRiverWall, false);
+  }
+  for (let lx = -158; lx <= -78; lx += 16) {
+    addBox(bridgeGroup, 0.2, 4.2, 0.2, lx, 10.6, 5.4, matDarkSteel, false);
+    addBox(bridgeGroup, 0.6, 0.18, 1.1, lx, 12.6, 4.9, matGold, false);
+  }
+  root.add(bridgeGroup);
 
   // =========================================================================
   // 1B. OUTSIDE-OF-CAMPUS STA. MESA & TERESA STREET CORRIDOR
@@ -664,12 +929,19 @@ export function buildPupCampusWorld(
   const outsideGroup = new THREE.Group();
   root.add(outsideGroup);
 
-  // Extended urban ground apron East outside PUP Main Gate through Old Sta. Mesa St.
-  const eastGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(184, 224)), matRawConcrete);
+  // Extended urban ground apron East outside PUP Main Gate through Old Sta. Mesa St & South Anonas St.
+  const eastGround = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(200, 365)), matRawConcrete);
   eastGround.rotation.x = -Math.PI / 2;
-  eastGround.position.set(174, 0.008, 0);
+  eastGround.position.set(180, 0.008, 66);
   eastGround.receiveShadow = true;
   outsideGroup.add(eastGround);
+
+  // Far-south Sta. Mesa urban concrete apron under the extended Barangay 630 -> Maui Oasis -> El Pueblo district
+  const southUrbanApron = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(165, 145)), matRawConcrete);
+  southUrbanApron.rotation.x = -Math.PI / 2;
+  southUrbanApron.position.set(52, 0.007, 176);
+  southUrbanApron.receiveShadow = true;
+  outsideGroup.add(southUrbanApron);
 
   // Shared PBR Materials for Authentic Manila / Sta. Mesa / Teresa Street Palette
   const matManilaBlue = trackMat(new THREE.MeshStandardMaterial({ color: 0x1756a9, roughness: 0.72 }));
@@ -713,9 +985,9 @@ export function buildPupCampusWorld(
   lampBulbs.push(matTeresaBulb);
 
   // --- 1B-1: ANONAS STREET, LONG CURVED FORECOURT SIDEWALKS, BARRIERS & PNR CONSTRUCTION FENCE (May 2026 Google Maps & Street View!) ---
-  const anonasRoad = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(10.6, 190)), matAsphalt);
+  const anonasRoad = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(10.6, 272)), matAsphalt);
   anonasRoad.rotation.x = -Math.PI / 2;
-  anonasRoad.position.set(90.6, 0.022, 0);
+  anonasRoad.position.set(90.6, 0.022, 41);
   anonasRoad.receiveShadow = true;
   outsideGroup.add(anonasRoad);
   // Deep flared concrete entrance forecourt roadway bridging Anonas St (x = 85.8) back to recessed Main Gate (x = 73.5)!
@@ -760,10 +1032,16 @@ export function buildPupCampusWorld(
   };
 
   // NORTH & SOUTH SWEPT CURVED BRICK SIDEWALKS (C1-continuous 6.6m-radius quarter-circle forecourt curves — photo-matched to 2026 satellite 10m scale & street photos!)
-  const northSwPts = generateCurvedSidewalkPolygon('north', PUP_FORECOURT_CONFIG);
+  // Cap straight Anonas extensions cleanly at Gym Gate mouth (z = -23.9) and South Side Gate mouth (z = 22.9) so zero raised slab or curb blocks either driveway apron!
+  const forecourtRenderCfg = {
+    ...PUP_FORECOURT_CONFIG,
+    anonasNorthEndZ: -23.9,
+    anonasSouthEndZ: 22.9,
+  };
+  const northSwPts = generateCurvedSidewalkPolygon('north', forecourtRenderCfg);
   addCurvedSlab(outsideGroup, northSwPts, 0.16, matForecourtBrick, 0.01);
 
-  const southSwPts = generateCurvedSidewalkPolygon('south', PUP_FORECOURT_CONFIG);
+  const southSwPts = generateCurvedSidewalkPolygon('south', forecourtRenderCfg);
   addCurvedSlab(outsideGroup, southSwPts, 0.16, matForecourtBrick, 0.01);
 
   // Subtle recessed concrete pedestrian curb ramps & gutter storm-drain grates flanking both curved forecourt aprons
@@ -796,10 +1074,10 @@ export function buildPupCampusWorld(
     blk.rotation.y = rotY;
     outsideGroup.add(blk);
   };
-  for (const seg of computeForecourtCurbSegments('north', PUP_FORECOURT_CONFIG)) {
+  for (const seg of computeForecourtCurbSegments('north', forecourtRenderCfg)) {
     addCurbBlock(seg.x, seg.z, seg.length, seg.rotY, seg.index);
   }
-  for (const seg of computeForecourtCurbSegments('south', PUP_FORECOURT_CONFIG)) {
+  for (const seg of computeForecourtCurbSegments('south', forecourtRenderCfg)) {
     addCurbBlock(seg.x, seg.z, seg.length, seg.rotY, seg.index);
   }
 
@@ -834,27 +1112,96 @@ export function buildPupCampusWorld(
       });
     }
     outsideGroup.add(bg);
+    addOBBCollider(`crowd-barrier-${++autoColliderIdx}`, bx, bz, len + 0.15, 0.56, rotY);
   };
   addCrowdBarrier(86.65, -18.2, 2.8, Math.PI / 2, 'NO PARKING', 'NO LOADING / UNLOADING');
   addCrowdBarrier(86.65, -21.6, 2.8, Math.PI / 2, 'DROP OFF', 'ONLY · KEEP CLEAR');
 
-  // Iconic Outside-PUP Street Food Pushcarts & Multi-Color Umbrellas along North Pylon Sidewalk
+  // Iconic Outside-PUP Street Food Pushcarts & Multi-Color Umbrellas neatly North of PUP Gymnasium Side Gate (keeps Gym Gate z = -28.0 100% clear!)
   const matCartGreen = trackMat(new THREE.MeshStandardMaterial({ color: 0x266b3a, roughness: 0.72 }));
   const matCartBlue = trackMat(new THREE.MeshStandardMaterial({ color: 0x2268b8, roughness: 0.72 }));
-  addBox(outsideGroup, 1.25, 1.05, 1.75, 84.8, 0.68, -24.8, matCartGreen, false);
-  addBox(outsideGroup, 1.38, 0.14, 1.9, 84.8, 1.98, -24.8, matTrikeRed, false);
-  addBox(outsideGroup, 0.06, 0.9, 0.06, 84.25, 1.55, -25.6, matSilverSteel, false);
-  addBox(outsideGroup, 0.06, 0.9, 0.06, 85.35, 1.55, -24.0, matSilverSteel, false);
-  addBox(outsideGroup, 1.15, 0.98, 1.65, 84.8, 0.64, -27.6, matCartBlue, false);
+  addBox(outsideGroup, 1.25, 1.05, 1.75, 84.4, 0.68, -35.2, matCartGreen, false);
+  addBox(outsideGroup, 1.38, 0.14, 1.9, 84.4, 1.98, -35.2, matTrikeRed, false);
+  addBox(outsideGroup, 0.06, 0.9, 0.06, 83.85, 1.55, -36.0, matSilverSteel, false);
+  addBox(outsideGroup, 0.06, 0.9, 0.06, 84.95, 1.55, -34.4, matSilverSteel, false);
+  addCollider('street-pushcart-green', 84.4, -35.2, 1.4, 1.9);
+
+  addBox(outsideGroup, 1.15, 0.98, 1.65, 84.4, 0.64, -38.4, matCartBlue, false);
   const vendorPole1 = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.03, 0.035, 2.4, 6)), matSilverSteel);
-  vendorPole1.position.set(84.8, 1.2, -27.6);
+  vendorPole1.position.set(84.4, 1.2, -38.4);
   outsideGroup.add(vendorPole1);
   const vendorUmb1 = new THREE.Mesh(trackGeo(new THREE.ConeGeometry(1.35, 0.48, 8)), matManilaYellow);
-  vendorUmb1.position.set(84.8, 2.48, -27.6);
+  vendorUmb1.position.set(84.4, 2.48, -38.4);
   outsideGroup.add(vendorUmb1);
   const vendorUmb2 = new THREE.Mesh(trackGeo(new THREE.ConeGeometry(1.25, 0.44, 8)), matUmbrellaBlue);
-  vendorUmb2.position.set(85.1, 2.42, -29.4);
+  vendorUmb2.position.set(84.6, 2.42, -40.2);
   outsideGroup.add(vendorUmb2);
+  addCollider('street-pushcart-blue', 84.4, -38.4, 1.35, 1.85);
+
+  // CONTINUOUS WEST ANONAS STREET SIDEWALK, CONCRETE DRAINAGE TRENCH, DROPPED DRIVEWAY APRONS & PEDESTRIAN CROSSWALKS
+  // Matches Google Maps & Instant Street View along the entire PUP frontage (closes all former sidewalk gaps & keeps all 3 Side Gates clear!)
+  const addWestAnonasSidewalkSegment = (zStart: number, zEnd: number) => {
+    const segLen = zEnd - zStart;
+    const zMid = (zStart + zEnd) / 2;
+    // Aligned collinearly with forecourt anonasCurbX = 86.4 so the entire West Anonas curbline is seamless
+    addBox(outsideGroup, 3.2, 0.15, segLen, 84.7, 0.075, zMid, matSidewalkConc, false);
+    for (let cz = zStart + 0.45; cz <= zEnd - 0.35; cz += 0.95) {
+      addBox(
+        outsideGroup,
+        0.26,
+        0.19,
+        0.88,
+        86.4,
+        0.095,
+        cz,
+        Math.abs(Math.round(cz)) % 2 === 0 ? matManilaYellow : matDarkSteel,
+        false,
+      );
+      // Recessed concrete gutter/drainage block along PUP wall sidewalk edge
+      addBox(outsideGroup, 0.54, 0.075, 0.82, 85.75, 0.058, cz, matRawConcrete, false);
+      if (Math.abs(Math.round(cz * 2)) % 3 === 0) {
+        addBox(outsideGroup, 0.4, 0.024, 0.34, 85.75, 0.1, cz, matDarkSteel, false);
+      }
+    }
+  };
+  // Continuous raised sidewalks neatly stopping at each PUP Side Gate mouth (Gym Gate z=-28, South Side Gate z=25, Oval Gate z=58)
+  // Note: z = 8.4..22.9 is seamlessly covered by the South curved brick forecourt slab (zero Z-fighting!)
+  addWestAnonasSidewalkSegment(-69.5, -32.2); // North of PUP Gymnasium Side Gate
+  addWestAnonasSidewalkSegment(27.2, 53.6);   // South Side Gate -> PUP Oval Gate (closes former 26m gap!)
+  addWestAnonasSidewalkSegment(62.4, 85.6);   // PUP Oval Gate -> SE Anonas curve
+
+  // Dropped concrete driveway aprons, flared curb wings, "KEEP CLEAR" markings, flanking bollards & white zebra crosswalks at all 3 PUP Side Gates!
+  const addSideGateStreetApron = (zCenter: number, mouthHalfWidth: number, hasKeepClearBox: boolean) => {
+    const mouthW = mouthHalfWidth * 2;
+    // Flush sloped concrete driveway apron bridging Anonas asphalt (x = 86.5) smoothly into gate threshold (x = 82.6)
+    addBox(outsideGroup, 3.9, 0.055, mouthW, 84.55, 0.032, zCenter, matRawConcrete, false);
+    // Crisp concrete expansion joint lines across driveway apron
+    addBox(outsideGroup, 3.8, 0.06, 0.06, 84.55, 0.035, zCenter - mouthHalfWidth + 0.15, matDarkSteel, false);
+    addBox(outsideGroup, 3.8, 0.06, 0.06, 84.55, 0.035, zCenter + mouthHalfWidth - 0.15, matDarkSteel, false);
+    // Low dropped yellow curb lip at gutter edge (flush for vehicles & wheelchairs)
+    addBox(outsideGroup, 0.28, 0.065, mouthW, 86.4, 0.038, zCenter, matManilaYellow, false);
+    // Protective yellow-and-black steel bollards flanking each side of the gate apron (outside the clear opening!)
+    for (const side of [-1, 1]) {
+      const bz = zCenter + side * (mouthHalfWidth + 0.42);
+      const bol = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.085, 0.095, 0.92, 8)), matManilaYellow);
+      bol.position.set(85.95, 0.56, bz);
+      outsideGroup.add(bol);
+      addBox(outsideGroup, 0.2, 0.14, 0.2, 85.95, 0.82, bz, matDarkSteel, false);
+    }
+    // White pedestrian zebra crosswalk right in front of the Side Gate across Anonas St (x = 87.2..94.4)
+    for (let cx = 87.2; cx <= 94.2; cx += 0.92) {
+      addBox(outsideGroup, 0.46, 0.022, 2.5, cx, 0.034, zCenter, matBrightWhite, false);
+    }
+    if (hasKeepClearBox) {
+      // Yellow painted "KEEP CLEAR" driveway box along West Anonas curb lane directly in front of vehicle gate
+      addBox(outsideGroup, 3.6, 0.02, 0.14, 88.4, 0.032, zCenter - mouthHalfWidth, matManilaYellow, false);
+      addBox(outsideGroup, 3.6, 0.02, 0.14, 88.4, 0.032, zCenter + mouthHalfWidth, matManilaYellow, false);
+      addBox(outsideGroup, 0.14, 0.02, mouthW, 90.2, 0.032, zCenter, matManilaYellow, false);
+    }
+  };
+  addSideGateStreetApron(-28.0, 4.1, true);  // PUP Gymnasium Side Gate (Vehicle & Pedestrian Access)
+  addSideGateStreetApron(25.0, 2.1, false);  // PUP South Side Gate / Dambanang Mabini Pedestrian Entrance
+  addSideGateStreetApron(58.0, 4.2, true);   // PUP Oval Gate (South Anonas Access)
 
   // East Anonas Street Sidewalk + Forest-Green Corrugated PNR Construction Fence + Real 2026 Corner Kiosks (EQUALTEA · Jelly Citea · Julie Canteen!)
   const matAnonasGreenFence = trackMat(new THREE.MeshStandardMaterial({ color: 0x1d703b, roughness: 0.66, metalness: 0.28 }));
@@ -890,6 +1237,7 @@ export function buildPupCampusWorld(
       width: 440,
       height: 140,
     });
+    addCollider(`anonas-kiosk-${Math.round(Math.abs(k.z))}`, 95.85, k.z, 1.5, 3.85);
   }
 
   // Concrete Meralco Utility Poles flanking Anonas Street outside PUP Main Gate + Dense Overhead Manila Cable Bundle
@@ -936,18 +1284,18 @@ export function buildPupCampusWorld(
   const matPlatformCanopy = trackMat(new THREE.MeshStandardMaterial({ color: 0x7b4c3d, roughness: 0.72 }));
   const matViaduct = trackMat(new THREE.MeshStandardMaterial({ color: 0xa2a09a, roughness: 0.84 }));
 
-  // Gravel railway bed running N–S immediately east of Anonas St (terminates cleanly south of z = 58 where tracks veer SE away from Brgy. 630 & Futura Centro)
-  const railBed = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(14.0, 152)), matBallast);
+  // Gravel railway bed running N–S immediately east of Anonas St (extends cleanly to z = 67 flanking PUP Side Gate & North Oval, north of Alfamart at z = 71.5)
+  const railBed = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(14.0, 162)), matBallast);
   railBed.rotation.x = -Math.PI / 2;
-  railBed.position.set(104.8, 0.024, -18);
+  railBed.position.set(104.8, 0.024, -13);
   railBed.receiveShadow = true;
   outsideGroup.add(railBed);
 
   // Twin parallel rail tracks + timber sleepers (x = 102.0 & 107.0)
   for (const trackX of [102.0, 107.0]) {
-    addBox(outsideGroup, 0.1, 0.13, 148, trackX - 0.55, 0.08, -18, matRailSteel, false);
-    addBox(outsideGroup, 0.1, 0.13, 148, trackX + 0.55, 0.08, -18, matRailSteel, false);
-    for (let sz = -74; sz <= 54; sz += 1.8) {
+    addBox(outsideGroup, 0.1, 0.13, 158, trackX - 0.55, 0.08, -13, matRailSteel, false);
+    addBox(outsideGroup, 0.1, 0.13, 158, trackX + 0.55, 0.08, -13, matRailSteel, false);
+    for (let sz = -74; sz <= 64; sz += 1.8) {
       if (sz > -9.2 && sz < 1.2) continue; // Smooth level-crossing concrete road planks along Teresa St
       addBox(outsideGroup, 1.85, 0.07, 0.22, trackX, 0.05, sz, matDarkSteel, false);
     }
@@ -1017,14 +1365,14 @@ export function buildPupCampusWorld(
   outsideGroup.add(trainGroup);
 
   // TWIN-DECK ELEVATED NLEX-SLEX CONNECTOR EXPRESSWAY VIADUCT (directly above PNR at y = 10.8m, Jan 2026 drone photo!)
-  // Two parallel concrete box-girder decks terminating cleanly past the z=56 pier where the real viaduct veers SE away from Maui Oasis & Futura Centro
+  // Two parallel concrete box-girder decks extending to z = 67 where the real viaduct veers SE away from Brgy. 630 & Futura Centro
   for (const deckX of [101.2, 110.4]) {
-    addBox(outsideGroup, 6.4, 1.25, 158, deckX, 10.8, -19, matViaduct, false);
-    addBox(outsideGroup, 0.42, 0.88, 158, deckX - 3.0, 11.82, -19, matRawConcrete, false);
-    addBox(outsideGroup, 0.42, 0.88, 158, deckX + 3.0, 11.82, -19, matRawConcrete, false);
+    addBox(outsideGroup, 6.4, 1.25, 168, deckX, 10.8, -14, matViaduct, false);
+    addBox(outsideGroup, 0.42, 0.88, 168, deckX - 3.0, 11.82, -14, matRawConcrete, false);
+    addBox(outsideGroup, 0.42, 0.88, 168, deckX + 3.0, 11.82, -14, matRawConcrete, false);
   }
   // Massive T-shaped concrete portal piers straddling the PNR corridor with a 22m wide clear span over Teresa St!
-  const viaductPierZs = [-56, -34, -14.8, 7.6, 32, 56];
+  const viaductPierZs = [-56, -34, -14.8, 7.6, 36, 65];
   for (let pi = 0; pi < viaductPierZs.length; pi++) {
     const vz = viaductPierZs[pi];
     // Twin vertical concrete portal columns + horizontal hammerhead cap beam
@@ -1141,6 +1489,7 @@ export function buildPupCampusWorld(
     outsideGroup.add(canopy);
     addBox(outsideGroup, 0.9, 0.06, 0.68, ux, 0.78, uz, matBrightWhite, false);
     addBox(outsideGroup, 0.08, 0.72, 0.08, ux, 0.4, uz, matDarkSteel, false);
+    addCollider(`teresa-umbrella-${++autoColliderIdx}`, ux, uz, 1.0, 0.8);
   };
 
   // Helper: detailed multi-bay Manila Teresa Street shophouse with narrow micro-stalls, carinderia display counters,
@@ -1836,6 +2185,7 @@ export function buildPupCampusWorld(
     addBox(tg, 0.44, 0.44, 0.2, -0.52, 0.24, 0.52, matTireRubber, false);
     addBox(tg, 0.44, 0.44, 0.2, 0.52, 0.24, 0.52, matTireRubber, false);
     outsideGroup.add(tg);
+    addOBBCollider(`trike-${++autoColliderIdx}`, tx, tz, 1.65, 1.25, rotY);
   };
   // Anonas St tricycle queue (clear of Main Gate crosswalk)
   addTricycle(93.8, 4.4, Math.PI * 0.52, matTrikeRed);
@@ -1866,9 +2216,10 @@ export function buildPupCampusWorld(
       titleColor: '#141414',
     });
     outsideGroup.add(jeep);
+    addOBBCollider(`jeepney-${++autoColliderIdx}`, jx, jz, 2.15, 6.2, rotY);
   };
-  // Passing Anonas St jeepney (clear of Main Gate sightline)
-  addJeepney(87.2, -32.5, 0, matJeepBlue, 'PUP · TERESA · STOP&SHOP');
+  // Passing Anonas St jeepney (clear of Main Gate & Gym Gate sightlines)
+  addJeepney(88.2, -37.5, 0, matJeepBlue, 'PUP · TERESA · STOP&SHOP');
 
   // --- 1B-4: OLD STA. MESA STREET & STOP & SHOP / CEBUANA JUNCTION (x = 201.5..226, ~215m East of PUP Gate) ---
   const oldStaMesaRoad = new THREE.Mesh(trackGeo(new THREE.PlaneGeometry(15.2, 190)), matAsphalt);
@@ -1918,878 +2269,60 @@ export function buildPupCampusWorld(
   addCollider('old-stamesa-arcade', 222.0, -4.0, 9.6, 44.0);
 
   // =========================================================================
-  // SOUTHEAST PATH TO MAUI OASIS BY FILINVEST, FUTURA CENTRO & EL PUEBLO MANILA
-  // Photo-matched to May 2026 Google Street View (2281–2315 Anonas St & Condo Access Road)!
+  // EXTENDED SOUTH ANONAS / BARANGAY 630 STREET -> FAR-SOUTH MAUI OASIS,
+  // FUTURA CENTRO & EL PUEBLO MANILA BOULEVARD (~140m+ south of PUP Oval!)
   // =========================================================================
-  const mauiPathGroup = new THREE.Group();
-  outsideGroup.add(mauiPathGroup);
-
-  const matWeatheredMossWall = trackMat(
-    new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      map: textures.weatheredWall,
-      bumpMap: textures.concreteBump,
-      bumpScale: 0.06,
-      roughness: 0.9,
-      metalness: 0.02,
-    }),
-  );
-  const matVineLush = trackMat(new THREE.MeshStandardMaterial({ color: 0x2c5c26, roughness: 0.88 }));
-  const matVineBright = trackMat(new THREE.MeshStandardMaterial({ color: 0x457d32, roughness: 0.86 }));
-  const matCondoCream = trackMat(new THREE.MeshStandardMaterial({ color: 0xebe1cf, roughness: 0.78 }));
-  const matCondoStone = trackMat(new THREE.MeshStandardMaterial({ color: 0x9b8972, roughness: 0.88 }));
-  const matCondoTerra = trackMat(new THREE.MeshStandardMaterial({ color: 0xc26d4f, roughness: 0.82 }));
-  const matCondoRoof = trackMat(new THREE.MeshStandardMaterial({ color: 0x5c3627, roughness: 0.78 }));
-  const matCondoBalconyGreen = trackMat(new THREE.MeshStandardMaterial({ color: 0x244734, roughness: 0.65, metalness: 0.25 }));
-  const matFuturaGray = trackMat(new THREE.MeshStandardMaterial({ color: 0xc8d0d8, roughness: 0.72 }));
-  const matFuturaBlueGray = trackMat(new THREE.MeshStandardMaterial({ color: 0x6f8296, roughness: 0.68 }));
-
-  // 1. Extended South Anonas Street Sidewalk, Yellow Curb, Concrete Drainage Trench & Roadway (z = 52..94)
-  // Matches south_2_oval_wall_mid.png (2281 Anonas St): concrete drainage trench & yellow curb right beneath the PUP Oval wall!
-  addBox(mauiPathGroup, 2.6, 0.14, 34.0, 84.3, 0.07, 69.0, matSidewalkConc, false);
-  for (let cz = 52.4; cz <= 85.2; cz += 0.95) {
-    addBox(mauiPathGroup, 0.24, 0.19, 0.88, 85.65, 0.095, cz, matManilaYellow, false);
-    // Recessed concrete drainage trench blocks along curb edge (south_2_oval_wall_mid.png!)
-    addBox(mauiPathGroup, 0.56, 0.08, 0.82, 85.05, 0.06, cz, matRawConcrete, false);
-    if (Math.round(cz * 2) % 3 === 0) {
-      addBox(mauiPathGroup, 0.42, 0.025, 0.36, 85.05, 0.105, cz, matDarkSteel, false);
-    }
-  }
-  // Overhanging tropical shrubs & roadside weed tufts hugging the PUP Oval wall plinth (south_2_oval_wall_mid.png!)
-  const shrubGeo = trackGeo(new THREE.DodecahedronGeometry(0.42, 0));
-  for (let bz = 30.0; bz <= 77.5; bz += 4.2) {
-    if (bz > 51.5 && bz < 64.5) continue; // Keep Oval Gate clear
-    const tuftA = new THREE.Mesh(shrubGeo, Math.round(bz) % 2 === 0 ? matVineLush : matVineBright);
-    tuftA.scale.set(1.1, 0.72, 1.45);
-    tuftA.position.set(83.25, 0.28, bz);
-    mauiPathGroup.add(tuftA);
-    const tuftB = new THREE.Mesh(shrubGeo, Math.round(bz) % 2 === 0 ? matVineBright : matVineLush);
-    tuftB.scale.set(0.85, 0.56, 1.1);
-    tuftB.position.set(83.35, 0.22, bz + 0.65);
-    mauiPathGroup.add(tuftB);
-  }
-
-  // East-side Anonas sidewalk + blue-and-yellow Manila curb + parked Sta. Mesa tricycles (z = 52..92)
-  addBox(mauiPathGroup, 2.8, 0.15, 42.0, 96.2, 0.075, 71.0, matSidewalkConc, false);
-  for (let cz = 52.4; cz <= 89.2; cz += 0.95) {
-    addBox(
-      mauiPathGroup,
-      0.24,
-      0.19,
-      0.88,
-      94.85,
-      0.095,
-      cz,
-      Math.round(cz) % 2 === 0 ? matManilaBlue : matManilaYellow,
-      false,
-    );
-  }
-
-  // Materials for Barangay 630 Zone 63 Hall, Alfamart, Street Furniture & Vehicles
-  const matBrgy630Blue = trackMat(new THREE.MeshStandardMaterial({ color: 0x1652a8, roughness: 0.56 }));
-  const matBrgyYellow = trackMat(new THREE.MeshStandardMaterial({ color: 0xf2c22e, roughness: 0.52 }));
-  const matBrgyRoof = trackMat(new THREE.MeshStandardMaterial({ color: 0x1a417a, roughness: 0.52, metalness: 0.25 }));
-  const matAlfamartRed = trackMat(new THREE.MeshStandardMaterial({ color: 0xd4222a, roughness: 0.48 }));
-  const matWaterBlue = trackMat(new THREE.MeshStandardMaterial({ color: 0x2ea0dc, roughness: 0.24, metalness: 0.15 }));
-  const matHydrantRed = trackMat(new THREE.MeshStandardMaterial({ color: 0xcf1f24, roughness: 0.45, metalness: 0.35 }));
-  const matSedanSilver = trackMat(new THREE.MeshStandardMaterial({ color: 0xc2c8ce, roughness: 0.32, metalness: 0.58 }));
-  const matSedanMaroon = trackMat(new THREE.MeshStandardMaterial({ color: 0x6e1b24, roughness: 0.34, metalness: 0.48 }));
-  const matMauiPoolWater = trackMat(
-    new THREE.MeshStandardMaterial({ color: 0x26b2d4, roughness: 0.16, metalness: 0.12 }),
-  );
-  const matMirrorGlass = trackMat(new THREE.MeshStandardMaterial({ color: 0xdfe9f2, roughness: 0.08, metalness: 0.92 }));
-
-  const wheelGeo = trackGeo(new THREE.CylinderGeometry(0.24, 0.24, 0.14, 10));
-  const addParkedTricycle = (tx: number, tz: number, rotY = 0, isRed = true) => {
-    const trike = new THREE.Group();
-    trike.position.set(tx, 0, tz);
-    trike.rotation.y = rotY;
-    const tCol = isRed ? matTrikeRed : matTrikeBlue;
-    addBox(trike, 1.25, 0.68, 1.95, 0, 0.52, 0, tCol, false);
-    addBox(trike, 1.12, 0.44, 0.12, 0, 1.08, -0.88, matGlass, false);
-    addBox(trike, 1.32, 0.1, 2.08, 0, 1.42, 0, matSilverSteel, false);
-    for (const [px, pz] of [[-0.54, -0.86], [0.54, -0.86], [-0.54, 0.86], [0.54, 0.86]]) {
-      addBox(trike, 0.05, 0.64, 0.05, px, 1.12, pz, matDarkSteel, false);
-    }
-    addBox(trike, 0.42, 0.56, 1.65, -0.93, 0.54, 0.05, matDarkSteel, false);
-    for (const [wx, wz] of [[-0.93, -0.6], [-0.93, 0.65], [0.6, 0.25]]) {
-      const wh = new THREE.Mesh(wheelGeo, matDarkSteel);
-      wh.rotation.z = Math.PI / 2;
-      wh.position.set(wx, 0.24, wz);
-      trike.add(wh);
-    }
-    mauiPathGroup.add(trike);
-  };
-  // Queued tricycles along East Anonas St (north of Alfamart & at TODA terminal)
-  addParkedTricycle(93.9, 53.2, 0, true);
-  addParkedTricycle(93.9, 57.6, 0, false);
-
-  // --- 1B. AUTHENTIC 630 ANONAS ST EAST CIVIC & COMMERCIAL BLOCK (2026 Google Maps: Alfamart -> Barangay 630 Zone 63 Hall -> Multi-Purpose Covered Court -> TODA Terminal!) ---
-  const brgyFootprints = computeBarangay630Footprints();
-
-  // (i) ALFAMART ANONAS STA. MESA (x = 100.4, z = 62.0, facing West onto Anonas St)
-  const alfaFp = brgyFootprints[0];
-  const alfaGrp = new THREE.Group();
-  alfaGrp.position.set(alfaFp.x, 0, alfaFp.z);
-  addBox(alfaGrp, alfaFp.width, 4.4, alfaFp.depth, 0, 2.2, 0, matBrightWhite);
-  addBox(alfaGrp, 0.18, 0.46, alfaFp.depth + 0.2, -alfaFp.width / 2 - 0.05, 4.18, 0, matAlfamartRed, false);
-  addBox(alfaGrp, 0.18, 0.22, alfaFp.depth + 0.2, -alfaFp.width / 2 - 0.05, 3.84, 0, matBrgyYellow, false);
-  addBox(alfaGrp, 0.18, 0.2, alfaFp.depth + 0.2, -alfaFp.width / 2 - 0.05, 3.62, 0, matBrgy630Blue, false);
-  // Glazed sliding storefront + glowing interior backing + ATM alcove + yellow sidewalk bollards
-  addBox(alfaGrp, 0.16, 2.65, 4.8, -alfaFp.width / 2 - 0.02, 1.38, 0.2, matGlass, false);
-  addBox(alfaGrp, 0.06, 2.65, 0.08, -alfaFp.width / 2 - 0.1, 1.38, -0.6, matSilverSteel, false);
-  addBox(alfaGrp, 0.06, 2.65, 0.08, -alfaFp.width / 2 - 0.1, 1.38, 1.0, matSilverSteel, false);
-  addBox(alfaGrp, 0.45, 1.45, 0.9, -alfaFp.width / 2 - 0.15, 0.95, -2.55, matBrgy630Blue, false);
-  addBox(alfaGrp, 0.06, 0.48, 0.56, -alfaFp.width / 2 - 0.39, 1.25, -2.55, matMirrorGlass, false);
-  for (const bz of [-3.1, -1.5, 1.8, 3.1]) {
-    addBox(alfaGrp, 0.14, 0.85, 0.14, -alfaFp.width / 2 - 0.85, 0.425, bz, matManilaYellow, false);
-  }
-  addSignMesh(alfaGrp, 5.8, 0.95, -alfaFp.width / 2 - 0.16, 3.95, 0, -Math.PI / 2, 'ALFAMART · ANONAS', 'OPEN 24 HOURS · GROCERY & ATM', {
-    bg: '#d4222a',
-    border: '#f2c22e',
-    titleColor: '#ffffff',
-    subtitleColor: '#fff2b2',
-  });
-  mauiPathGroup.add(alfaGrp);
-  addCollider(alfaFp.id, alfaFp.x, alfaFp.z, alfaFp.width + 0.4, alfaFp.depth + 0.2);
-
-  // (ii) BARANGAY 630, ZONE 63, DISTRICT VI HALL (x = 100.8, z = 71.8 — photo-matched to real 630 Anonas St street photo!)
-  const brgyFp = brgyFootprints[1];
-  const brgyHallGrp = new THREE.Group();
-  brgyHallGrp.position.set(brgyFp.x, 0, brgyFp.z);
-  addContactShadow(brgyHallGrp, 0, 0, brgyFp.width + 1.8, brgyFp.depth + 1.4);
-  // Concrete plinth + entry steps + 2-story bright-white masonry hall with royal-blue wainscot
-  addBox(brgyHallGrp, brgyFp.width, 0.32, brgyFp.depth, 0, 0.16, 0, matSidewalkConc, false);
-  addBox(brgyHallGrp, brgyFp.width, 6.7, brgyFp.depth, 0, 3.65, 0, matBrightWhite);
-  addBox(brgyHallGrp, brgyFp.width + 0.12, 1.35, brgyFp.depth + 0.12, 0, 0.98, 0, matBrgy630Blue, false);
-  // Golden-yellow civic belt course between 1st & 2nd floor + royal-blue top cornice
-  addBox(brgyHallGrp, brgyFp.width + 0.22, 0.24, brgyFp.depth + 0.22, 0, 3.65, 0, matBrgyYellow, false);
-  addBox(brgyHallGrp, brgyFp.width + 0.24, 0.34, brgyFp.depth + 0.24, 0, 6.88, 0, matBrgy630Blue, false);
-  // Sloped royal-blue corrugated roof with crisp white overhanging soffit
-  addBox(brgyHallGrp, brgyFp.width + 0.9, 0.18, brgyFp.depth + 0.9, 0, 7.12, 0, matBrightWhite, false);
-  const brgyRoof = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(brgyFp.width + 1.1, 0.24, brgyFp.depth + 1.1)), matBrgyRoof);
-  brgyRoof.position.set(0, 7.52, 0);
-  brgyRoof.rotation.z = -0.14;
-  brgyRoof.castShadow = castShadow;
-  brgyHallGrp.add(brgyRoof);
-
-  // Ground-floor covered entry porch canopy + blue steel columns + reception desk & sliding teller windows
-  addBox(brgyHallGrp, 1.55, 0.18, 7.4, -brgyFp.width / 2 - 0.72, 3.28, 0, matBrgy630Blue, false);
-  addBox(brgyHallGrp, 1.62, 0.1, 7.48, -brgyFp.width / 2 - 0.72, 3.4, 0, matBrgyYellow, false);
-  for (const cz of [-3.4, 0.0, 3.4]) {
-    addBox(brgyHallGrp, 0.16, 3.1, 0.16, -brgyFp.width / 2 - 1.32, 1.72, cz, matBrgy630Blue, false);
-  }
-  // Security-grilled entrance door + sliding aluminum reception window + community bulletin board
-  addBox(brgyHallGrp, 0.14, 2.45, 1.75, -brgyFp.width / 2 - 0.02, 1.55, -1.65, matGlass, false);
-  for (let gz = -2.35; gz <= -0.95; gz += 0.28) {
-    addBox(brgyHallGrp, 0.04, 2.4, 0.04, -brgyFp.width / 2 - 0.11, 1.55, gz, matBrgy630Blue, false);
-  }
-  addBox(brgyHallGrp, 0.14, 1.45, 2.45, -brgyFp.width / 2 - 0.02, 1.95, 1.45, matGlass, false);
-  addBox(brgyHallGrp, 0.34, 0.08, 2.55, -brgyFp.width / 2 - 0.16, 1.24, 1.45, matSilverSteel, false);
-  // Community bulletin board with notices on front wall
-  addBox(brgyHallGrp, 0.08, 1.15, 1.45, -brgyFp.width / 2 - 0.05, 1.95, 3.75, matBrgy630Blue, false);
-  addBox(brgyHallGrp, 0.04, 0.92, 1.25, -brgyFp.width / 2 - 0.1, 1.95, 3.75, matBrightWhite, false);
-
-  // Second-floor council office multi-pane aluminum windows + split AC condensers
-  for (const wz of [-3.0, 0.0, 3.0]) {
-    addBox(brgyHallGrp, 0.14, 1.55, 2.15, -brgyFp.width / 2 - 0.02, 5.25, wz, matGlass, false);
-    addBox(brgyHallGrp, 0.06, 1.58, 0.06, -brgyFp.width / 2 - 0.09, 5.25, wz, matSilverSteel, false);
-    addBox(brgyHallGrp, 0.32, 0.08, 2.28, -brgyFp.width / 2 - 0.14, 6.08, wz, matBrightWhite, false);
-  }
-  addBox(brgyHallGrp, 0.38, 0.56, 0.72, -brgyFp.width / 2 - 0.18, 4.15, -4.1, matCreamWall, false);
-  addBox(brgyHallGrp, 0.38, 0.56, 0.72, -brgyFp.width / 2 - 0.18, 4.15, 4.1, matCreamWall, false);
-
-  // Iconic Royal-Blue & Golden-Yellow Manila Barangay 630 Fascia Signboard
-  addSignMesh(
-    brgyHallGrp,
-    7.8,
-    1.15,
-    -brgyFp.width / 2 - 0.16,
-    6.45,
-    0,
-    -Math.PI / 2,
-    'BARANGAY 630 · ZONE 63',
-    'DISTRICT VI · CITY OF MANILA · 630 ANONAS ST.',
-    {
-      bg: '#144b9e',
-      border: '#f2c22e',
-      titleColor: '#ffffff',
-      subtitleColor: '#fde078',
-      width: 640,
-      height: 150,
+  buildMauiCorridor({
+    parent: outsideGroup,
+    textures,
+    trackGeo,
+    trackMat,
+    addBox,
+    addCollider,
+    addOBBCollider,
+    addSignMesh,
+    createAnimatedWaterMaterial,
+    animatedFlags,
+    waterMeshes,
+    mats: {
+      matSidewalkConc,
+      matAsphalt,
+      matRawConcrete,
+      matCreamWall,
+      matBrightWhite,
+      matMaroon,
+      matGold,
+      matGlass,
+      matDarkSteel,
+      matSilverSteel,
+      matWood,
+      matManilaBlue,
+      matManilaYellow,
+      matTrikeRed,
+      matTrikeBlue,
+      matTrikeGreen,
+      matTreeTrunk,
+      matTreeFoliage,
+      matCable,
+      matTeresaBulb,
+      matWindowGlow,
+      matDormOchre,
+      matUmbrellaRed,
+      matUmbrellaOrange,
+      matGrass,
     },
-  );
-  addSignMesh(
-    brgyHallGrp,
-    4.4,
-    0.72,
-    -brgyFp.width / 2 - 1.58,
-    3.42,
-    0,
-    -Math.PI / 2,
-    'BRGY. 630 TANOD OUTPOST',
-    '24/7 PEACE & ORDER · CLEARANCE DESK',
-    {
-      bg: '#f2c22e',
-      border: '#144b9e',
-      titleColor: '#0e2d64',
-      subtitleColor: '#144b9e',
-      width: 480,
-      height: 110,
-    },
-  );
-
-  // Philippine Flagpole standing proudly beside Barangay 630 Hall steps
-  const brgy630FlagPole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.045, 0.06, 7.6, 8)), matSilverSteel);
-  brgy630FlagPole.position.set(-brgyFp.width / 2 - 1.25, 3.8, -4.55);
-  brgyHallGrp.add(brgy630FlagPole);
-  addBox(brgyHallGrp, 0.45, 0.36, 0.45, -brgyFp.width / 2 - 1.25, 0.18, -4.55, matBrgy630Blue, false);
-  // Crisp Philippine Flag (royal blue top, scarlet bottom, white triangle hoist)
-  addBox(brgyHallGrp, 0.03, 0.44, 1.35, -brgyFp.width / 2 - 1.25, 7.22, -3.85, matBrgy630Blue, false);
-  addBox(brgyHallGrp, 0.03, 0.44, 1.35, -brgyFp.width / 2 - 1.25, 6.78, -3.85, matAlfamartRed, false);
-  addBox(brgyHallGrp, 0.04, 0.88, 0.46, -brgyFp.width / 2 - 1.25, 7.0, -4.3, matBrightWhite, false);
-
-  // Barangay Tanod Outpost Desk, Plastic Monobloc Chairs & Manila Steel Barriers out front
-  addBox(brgyHallGrp, 0.65, 0.78, 1.25, -brgyFp.width / 2 - 0.82, 0.48, 3.45, matWood, false);
-  addBox(brgyHallGrp, 0.44, 0.46, 0.44, -brgyFp.width / 2 - 0.85, 0.24, 4.35, matBrgy630Blue, false);
-  addBox(brgyHallGrp, 0.44, 0.46, 0.44, -brgyFp.width / 2 - 0.85, 0.24, 2.55, matBrightWhite, false);
-  for (const bz of [-4.2, 4.2]) {
-    addBox(brgyHallGrp, 0.12, 0.92, 1.55, -brgyFp.width / 2 - 1.85, 0.46, bz, matBrgy630Blue, false);
-    addBox(brgyHallGrp, 0.14, 0.22, 1.58, -brgyFp.width / 2 - 1.85, 0.76, bz, matBrgyYellow, false);
-  }
-  mauiPathGroup.add(brgyHallGrp);
-  addCollider(brgyFp.id, brgyFp.x, brgyFp.z, brgyFp.width + 1.8, brgyFp.depth + 0.4);
-
-  // White & Royal-Blue Barangay 630 Patrol Multicab parked right in front of Barangay Hall!
-  const patrolCab = new THREE.Group();
-  patrolCab.position.set(93.65, 0, 72.4);
-  addBox(patrolCab, 1.62, 1.15, 1.55, 0, 0.86, -1.05, matBrightWhite);
-  addBox(patrolCab, 1.65, 0.34, 1.58, 0, 0.56, -1.05, matBrgy630Blue, false);
-  addBox(patrolCab, 1.48, 0.58, 0.08, 0, 1.12, -1.82, matGlass, false);
-  // Covered rear patrol bench canopy + amber roof emergency lightbar
-  addBox(patrolCab, 1.64, 0.62, 2.15, 0, 0.68, 0.78, matBrgy630Blue);
-  addBox(patrolCab, 1.66, 0.12, 2.2, 0, 1.84, 0.78, matBrightWhite, false);
-  for (const [px, pz] of [[-0.76, -0.22], [0.76, -0.22], [-0.76, 1.78], [0.76, 1.78]]) {
-    addBox(patrolCab, 0.06, 0.92, 0.06, px, 1.38, pz, matSilverSteel, false);
-  }
-  addBox(patrolCab, 0.72, 0.14, 0.22, 0, 1.56, -1.05, matBrgyYellow, false);
-  addSignMesh(patrolCab, 1.75, 0.34, -0.85, 0.72, 0.78, -Math.PI / 2, 'BRGY. 630 PATROL', '', {
-    bg: '#144b9e',
-    border: '#f2c22e',
-    titleColor: '#ffffff',
-    width: 320,
-    height: 80,
-  });
-  for (const [wx, wz] of [[-0.78, -1.2], [0.78, -1.2], [-0.78, 1.15], [0.78, 1.15]]) {
-    const wh = new THREE.Mesh(wheelGeo, matDarkSteel);
-    wh.rotation.z = Math.PI / 2;
-    wh.position.set(wx, 0.26, wz);
-    patrolCab.add(wh);
-  }
-  mauiPathGroup.add(patrolCab);
-  addCollider('brgy630-patrol-cab', 93.65, 72.4, 1.9, 3.9);
-
-  // (iii) BARANGAY 630 MULTI-PURPOSE COVERED COURT / HALF-COURT ANNEX (x = 102.2, z = 83.2)
-  const courtFp = brgyFootprints[2];
-  const courtGrp = new THREE.Group();
-  courtGrp.position.set(courtFp.x, 0, courtFp.z);
-  // Painted concrete court slab + court markings
-  addBox(courtGrp, courtFp.width, 0.14, courtFp.depth, 0, 0.07, 0, matBrgy630Blue, false);
-  addBox(courtGrp, courtFp.width - 1.2, 0.15, courtFp.depth - 1.2, 0, 0.08, 0, matCondoTerra, false);
-  addBox(courtGrp, 3.2, 0.16, 4.4, 2.2, 0.085, 0, matBrgy630Blue, false);
-  // 6 steel roof columns + arched/pitched blue corrugated covered-court roof truss
-  for (const cx of [-4.4, 4.4]) {
-    for (const cz of [-4.8, 0, 4.8]) {
-      addBox(courtGrp, 0.26, 5.4, 0.26, cx, 2.7, cz, matBrgy630Blue, false);
-    }
-  }
-  const cRoofL = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(5.6, 0.16, courtFp.depth + 0.8)), matBrgyRoof);
-  cRoofL.position.set(-2.5, 5.95, 0);
-  cRoofL.rotation.z = 0.24;
-  courtGrp.add(cRoofL);
-  const cRoofR = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(5.6, 0.16, courtFp.depth + 0.8)), matBrgyRoof);
-  cRoofR.position.set(2.5, 5.95, 0);
-  cRoofR.rotation.z = -0.24;
-  courtGrp.add(cRoofR);
-  // Basketball hoop stanchion + transparent backboard + orange rim + spectator bench
-  addBox(courtGrp, 0.18, 3.4, 0.18, 4.1, 1.7, 0, matDarkSteel, false);
-  addBox(courtGrp, 0.08, 1.05, 1.65, 3.55, 3.35, 0, matBrightWhite, false);
-  addBox(courtGrp, 0.42, 0.06, 0.42, 3.25, 3.0, 0, matAlfamartRed, false);
-  addBox(courtGrp, 0.55, 0.48, 5.2, -4.1, 0.24, 0, matSidewalkConc, false);
-  addSignMesh(courtGrp, 6.2, 0.78, -4.65, 5.35, 0, -Math.PI / 2, 'BRGY. 630 COVERED COURT', 'MULTI-PURPOSE HALL · YOUTH & SPORTS', {
-    bg: '#144b9e',
-    border: '#f2c22e',
-    titleColor: '#ffffff',
-    subtitleColor: '#fde078',
-  });
-  mauiPathGroup.add(courtGrp);
-  addCollider(courtFp.id, courtFp.x, courtFp.z, courtFp.width + 0.2, courtFp.depth + 0.2);
-
-  // (iv) ANONAS–PUP TODA TRICYCLE TERMINAL WAITING SHED at SE Bend (x = 96.4, z = 91.2)
-  const todaGrp = new THREE.Group();
-  todaGrp.position.set(96.4, 0, 91.2);
-  addBox(todaGrp, 2.2, 0.16, 4.6, 0, 0.08, 0, matSidewalkConc, false);
-  for (const [px, pz] of [[-0.9, -2.0], [0.9, -2.0], [-0.9, 2.0], [0.9, 2.0]]) {
-    addBox(todaGrp, 0.1, 2.55, 0.1, px, 1.32, pz, matCondoBalconyGreen, false);
-  }
-  const todaRoof = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(2.65, 0.12, 5.1)), matCondoBalconyGreen);
-  todaRoof.position.set(0, 2.68, 0);
-  todaRoof.rotation.z = -0.12;
-  todaGrp.add(todaRoof);
-  addBox(todaGrp, 0.55, 0.48, 3.6, 0.55, 0.34, 0, matWood, false);
-  addSignMesh(todaGrp, 3.8, 0.58, -1.22, 2.52, 0, -Math.PI / 2, 'ANONAS–PUP TODA', 'TRICYCLE TERMINAL · MAUI OASIS · EL PUEBLO', {
-    bg: '#1d663a',
-    border: '#f2c22e',
-    titleColor: '#ffffff',
-    subtitleColor: '#f7e088',
-  });
-  mauiPathGroup.add(todaGrp);
-  addCollider('anonas-toda-shed', 96.4, 91.2, 2.4, 4.8);
-  addParkedTricycle(93.8, 89.2, 0.18, true);
-  addParkedTricycle(93.1, 93.4, 0.42, false);
-
-  // Southern Filinvest perimeter screen wall & tropical trees closing the far South horizon behind the SE curve
-  const southCurveWallGrp = new THREE.Group();
-  southCurveWallGrp.position.set(70.0, 0, 114.5);
-  southCurveWallGrp.rotation.y = 0.26;
-  addBox(southCurveWallGrp, 52.0, 2.5, 0.45, 0, 1.25, 0, matCondoCream, false);
-  addBox(southCurveWallGrp, 52.2, 0.22, 0.58, 0, 2.58, 0, matCondoStone, false);
-  for (let sx = -22; sx <= 22; sx += 5.5) {
-    addBox(southCurveWallGrp, 0.48, 2.7, 0.62, sx, 1.35, 0, matCondoStone, false);
-    const sTrunk = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.18, 0.24, 4.6, 7)), matTreeTrunk);
-    sTrunk.position.set(sx + 1.8, 2.3, 1.8);
-    southCurveWallGrp.add(sTrunk);
-    const sCrown = new THREE.Mesh(trackGeo(new THREE.DodecahedronGeometry(2.8, 0)), matTreeFoliage);
-    sCrown.scale.set(1.3, 0.85, 1.2);
-    sCrown.position.set(sx + 1.8, 5.4, 1.6);
-    southCurveWallGrp.add(sCrown);
-  }
-  mauiPathGroup.add(southCurveWallGrp);
-
-  // 2. SE Curve Recessed Dark-Green Slotted-Iron Service Gate & Meralco Triple-Transformer Pole (2315 Anonas St — south_3_oval_wall_curve.png!)
-  const seGateX = 82.6;
-  addBox(mauiPathGroup, 0.68, 2.85, 0.68, seGateX, 1.425, 78.8, matCreamWall, false);
-  addBox(mauiPathGroup, 0.82, 0.2, 0.82, seGateX, 2.9, 78.8, matMaroon, false);
-  addBox(mauiPathGroup, 0.68, 2.85, 0.68, seGateX, 1.425, 84.4, matCreamWall, false);
-  addBox(mauiPathGroup, 0.82, 0.2, 0.82, seGateX, 2.9, 84.4, matMaroon, false);
-  // Recessed dark-green corrugated service panel + angled green slotted iron picket gate leaf
-  const matServiceGateGreen = trackMat(new THREE.MeshStandardMaterial({ color: 0x2a5436, roughness: 0.62, metalness: 0.35 }));
-  addBox(mauiPathGroup, 0.22, 2.35, 5.1, seGateX - 0.12, 1.22, 81.6, matRawConcrete, false);
-  for (let pz = 79.3; pz <= 83.9; pz += 0.28) {
-    addBox(mauiPathGroup, 0.05, 2.15, 0.06, seGateX + 0.22, 1.12, pz, matServiceGateGreen, false);
-  }
-  addBox(mauiPathGroup, 0.08, 0.08, 4.8, seGateX + 0.22, 1.95, 81.6, matServiceGateGreen, false);
-  addBox(mauiPathGroup, 0.08, 0.08, 4.8, seGateX + 0.22, 0.42, 81.6, matServiceGateGreen, false);
-  addSignMesh(mauiPathGroup, 1.85, 1.25, seGateX + 0.32, 1.32, 81.6, Math.PI / 2, 'NO PARKING', 'PUP PERIMETER · DRIVEWAY CLEAR', {
-    bg: '#f6f3eb',
-    border: '#b51d1d',
-    titleColor: '#b51d1d',
-    subtitleColor: '#1f2328',
-    width: 384,
-    height: 256,
-  });
-  addCollider('se-service-gate-wall', seGateX, 81.6, 0.9, 6.2);
-
-  // Iconic Meralco Pole with Triple Cylindrical Gray Transformers + Convex Orange Traffic Mirror right at the 2315 Anonas St curve!
-  const curvePole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.18, 0.24, 11.4, 8)), matRawConcrete);
-  curvePole.position.set(84.4, 5.7, 86.2);
-  mauiPathGroup.add(curvePole);
-  addBox(mauiPathGroup, 2.4, 0.14, 0.14, 84.4, 9.6, 86.2, matDarkSteel, false);
-  addBox(mauiPathGroup, 2.4, 0.14, 0.14, 84.4, 8.2, 86.2, matDarkSteel, false);
-  for (const dx of [-0.62, 0.0, 0.62]) {
-    const xfrmr = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.24, 0.24, 0.92, 10)), matSilverSteel);
-    xfrmr.position.set(84.4 + dx, 7.6, 85.85);
-    mauiPathGroup.add(xfrmr);
-  }
-  // Convex orange-rimmed street safety mirror at the blind 2315 Anonas St curve
-  const mirrorPole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.055, 0.065, 3.1, 8)), matManilaYellow);
-  mirrorPole.position.set(84.9, 1.55, 89.2);
-  mauiPathGroup.add(mirrorPole);
-  const mirrorRim = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.46, 0.46, 0.1, 14)), matAlfamartRed);
-  mirrorRim.rotation.x = Math.PI / 2;
-  mirrorRim.rotation.z = -0.65;
-  mirrorRim.position.set(84.9, 2.95, 89.2);
-  mauiPathGroup.add(mirrorRim);
-  const mirrorDisc = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.39, 0.39, 0.12, 14)), matMirrorGlass);
-  mirrorDisc.rotation.x = Math.PI / 2;
-  mirrorDisc.rotation.z = -0.65;
-  mirrorDisc.position.set(84.9, 2.95, 89.2);
-  mauiPathGroup.add(mirrorDisc);
-
-  // 3. Sweeping Divided Tree-Lined Boulevard Curving SW past Maui Oasis, Futura Centro & El Pueblo
-  const mauiRoadApron = new THREE.Mesh(unitPlaneGeo, matAsphalt);
-  mauiRoadApron.scale.set(66, 20, 1);
-  mauiRoadApron.rotation.x = -Math.PI / 2;
-  mauiRoadApron.rotation.z = MAUI_CORRIDOR_CONFIG.boulevardAngleRad;
-  mauiRoadApron.position.set(MAUI_CORRIDOR_CONFIG.boulevardOrigin.x, 0.021, MAUI_CORRIDOR_CONFIG.boulevardOrigin.z);
-  mauiRoadApron.receiveShadow = true;
-  mauiPathGroup.add(mauiRoadApron);
-  // Corner junction paving linking Anonas St (z = 84..96) into the SW boulevard
-  const cornerRoad = new THREE.Mesh(unitPlaneGeo, matAsphalt);
-  cornerRoad.scale.set(22, 22, 1);
-  cornerRoad.rotation.x = -Math.PI / 2;
-  cornerRoad.position.set(89.5, 0.022, 92.5);
-  cornerRoad.receiveShadow = true;
-  mauiPathGroup.add(cornerRoad);
-
-  // Road Markings: Yellow Dashed Centerlines + Crisp White Pedestrian Crosswalks + Speed Humps!
-  for (let dz = 53.5; dz <= 83.2; dz += 3.6) {
-    if ((dz > 64.6 && dz < 71.8) || (dz > 83.6 && dz < 88.6)) continue;
-    addBox(mauiPathGroup, 0.16, 0.018, 1.8, 90.4, 0.032, dz, matManilaYellow, false);
-  }
-  // Pedestrian crosswalks along South Anonas St (fronting Barangay 630 Hall & approaching SE bend)
-  for (const cz of [69.6, 86.8]) {
-    for (let cx = 86.6; cx <= 93.8; cx += 0.9) {
-      addBox(mauiPathGroup, 0.45, 0.02, 2.4, cx, 0.035, cz, matBrightWhite, false);
-    }
-  }
-  // Pedestrian crosswalks along curving Maui Oasis / El Pueblo boulevard
-  for (const alongX of [2.5, -21.0]) {
-    const xwalk = new THREE.Group();
-    const xpt = computeBoulevardWorldPoint(alongX, 1.5);
-    xwalk.position.set(xpt.x, 0.034, xpt.z);
-    xwalk.rotation.y = MAUI_CORRIDOR_CONFIG.boulevardAngleRad;
-    for (let lz = -5.2; lz <= 5.2; lz += 1.0) {
-      addBox(xwalk, 2.2, 0.02, 0.46, 0, 0, lz, matBrightWhite, false);
-    }
-    mauiPathGroup.add(xwalk);
-  }
-  // Yellow-and-Black Asphalt Speed Humps (Rumble Bumps) along Anonas St & Maui Oasis Blvd
-  for (const h of computeMauiSpeedHumps()) {
-    const humpGrp = new THREE.Group();
-    humpGrp.position.set(h.x, 0, h.z);
-    humpGrp.rotation.y = h.rotY;
-    for (let s = -4; s <= 4; s++) {
-      addBox(
-        humpGrp,
-        0.78,
-        0.095,
-        0.76,
-        s * 0.8,
-        0.048,
-        0,
-        Math.abs(s) % 2 === 0 ? matManilaYellow : matDarkSteel,
-        false,
-      );
-    }
-    mauiPathGroup.add(humpGrp);
-  }
-
-  // Continuous Meralco Concrete Utility Poles + Cobra-Head Streetlamps + Overhead Manila Cable Runs!
-  const corridorPoles = computeMauiCorridorPoles();
-  for (let pi = 0; pi < corridorPoles.length; pi++) {
-    const p = corridorPoles[pi];
-    const poleGrp = new THREE.Group();
-    poleGrp.position.set(p.x, 0, p.z);
-    poleGrp.rotation.y = p.rotY;
-    const shaft = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.13, 0.18, 9.6, 8)), matRawConcrete);
-    shaft.position.set(0, 4.8, 0);
-    poleGrp.add(shaft);
-    // Blue-and-yellow Manila striped lower utility pole warning wrap
-    addBox(poleGrp, 0.34, 0.85, 0.34, 0, 1.45, 0, matManilaBlue, false);
-    addBox(poleGrp, 0.35, 0.55, 0.35, 0, 2.15, 0, matManilaYellow, false);
-    // Crossbar + cobra-head LED streetlight arm projecting over road
-    addBox(poleGrp, 1.8, 0.1, 0.12, 0, 8.6, 0, matDarkSteel, false);
-    addBox(poleGrp, 0.1, 0.08, 2.1, 0, 7.6, 1.05, matSilverSteel, false);
-    addBox(poleGrp, 0.36, 0.12, 0.65, 0, 7.55, 2.05, matTeresaBulb, false);
-    mauiPathGroup.add(poleGrp);
-
-    // Overhead power/fiber cables connecting consecutive poles along the same street segment
-    if (pi !== 3 && pi + 1 < corridorPoles.length) {
-      const next = corridorPoles[pi + 1];
-      const dx = next.x - p.x;
-      const dz = next.z - p.z;
-      const span = Math.hypot(dx, dz);
-      const midX = (p.x + next.x) / 2;
-      const midZ = (p.z + next.z) / 2;
-      const yaw = Math.atan2(dx, dz);
-      for (const cy of [8.55, 7.95, 7.45]) {
-        const wire = new THREE.Mesh(trackGeo(new THREE.BoxGeometry(0.032, 0.032, span)), matDarkSteel);
-        wire.position.set(midX, cy, midZ);
-        wire.rotation.y = yaw;
-        mauiPathGroup.add(wire);
-      }
-    }
-  }
-
-  // Manila Street Furniture: Fire Hydrants, Segregated Trash Bins, Regulatory Signs & Parked Sedans!
-  for (const [hx, hz] of [
-    [85.2, 63.2],
-    [95.4, 77.2],
-  ]) {
-    const hyd = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.14, 0.16, 0.72, 8)), matHydrantRed);
-    hyd.position.set(hx, 0.36, hz);
-    mauiPathGroup.add(hyd);
-    const hydCap = new THREE.Mesh(trackGeo(new THREE.SphereGeometry(0.14, 8, 6)), matHydrantRed);
-    hydCap.position.set(hx, 0.74, hz);
-    mauiPathGroup.add(hydCap);
-  }
-  for (const [bx, bz] of [
-    [95.4, 65.8],
-    [95.4, 86.2],
-  ]) {
-    addBox(mauiPathGroup, 0.42, 0.78, 0.42, bx, 0.48, bz, matCondoBalconyGreen, false);
-    addBox(mauiPathGroup, 0.42, 0.78, 0.42, bx, 0.48, bz + 0.52, matBrgy630Blue, false);
-  }
-  // Regulatory Street Signs along South Anonas St ("ANONAS ST. · BRGY. 630", "SPEED LIMIT 20 KPH")
-  const addStreetSignPost = (sx: number, sz: number, rotY: number, title: string, sub: string, bg: string) => {
-    const pole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.045, 0.055, 3.1, 6)), matSilverSteel);
-    pole.position.set(sx, 1.55, sz);
-    mauiPathGroup.add(pole);
-    addSignMesh(mauiPathGroup, 1.45, 0.62, sx, 2.85, sz, rotY, title, sub, {
-      bg,
-      border: '#ffffff',
-      titleColor: '#ffffff',
-      subtitleColor: '#f2e8b8',
-      width: 360,
-      height: 150,
-    });
-  };
-  addStreetSignPost(95.3, 60.0, -Math.PI / 2, 'ANONAS ST.', 'BRGY. 630 · ZONE 63', '#155c38');
-  addStreetSignPost(85.3, 73.5, Math.PI / 2, 'SPEED LIMIT 20', 'SLOW DOWN · BRGY. HALL', '#144b9e');
-
-  // Landscaped Concrete Center Median Island with Shade Trees & Flared Street Lamps
-  const medianGrp = new THREE.Group();
-  medianGrp.position.set(66.0, 0, 102.2);
-  medianGrp.rotation.y = MAUI_CORRIDOR_CONFIG.boulevardAngleRad;
-  addBox(medianGrp, 34.0, 0.24, 2.8, 0, 0.12, 0, matSidewalkConc, false);
-  addBox(medianGrp, 32.8, 0.16, 2.0, 0, 0.22, 0, matCondoStone, false);
-  for (let mx = -14; mx <= 14; mx += 7.0) {
-    const mTrunk = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.14, 0.2, 3.6, 7)), matTreeTrunk);
-    mTrunk.position.set(mx, 1.95, 0);
-    medianGrp.add(mTrunk);
-    const mCrown = new THREE.Mesh(trackGeo(new THREE.DodecahedronGeometry(2.15, 0)), matTreeFoliage);
-    mCrown.scale.set(1.25, 0.78, 1.15);
-    mCrown.position.set(mx, 4.35, 0);
-    medianGrp.add(mCrown);
-    if (mx < 14) {
-      const lampX = mx + 3.5;
-      const lPost = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.06, 0.08, 4.2, 6)), matDarkSteel);
-      lPost.position.set(lampX, 2.2, 0);
-      medianGrp.add(lPost);
-      const lCap = new THREE.Mesh(trackGeo(new THREE.ConeGeometry(0.45, 0.24, 6)), matDarkSteel);
-      lCap.position.set(lampX, 4.42, 0);
-      lCap.rotation.x = Math.PI;
-      medianGrp.add(lCap);
-      addBox(medianGrp, 0.28, 0.16, 0.28, lampX, 4.22, 0, matTeresaBulb, false);
-    }
-  }
-  mauiPathGroup.add(medianGrp);
-
-  // --- 3B. SOUTH-EAST SIDE OF MAUI OASIS BOULEVARD: SIDEWALK, LOCAL SHOPS (WATER REFILLING, TAPSILOGAN, VULCANIZING) & PARKED CARS ---
-  const southBlvdGrp = new THREE.Group();
-  southBlvdGrp.position.set(MAUI_CORRIDOR_CONFIG.boulevardOrigin.x, 0, MAUI_CORRIDOR_CONFIG.boulevardOrigin.z);
-  southBlvdGrp.rotation.y = MAUI_CORRIDOR_CONFIG.boulevardAngleRad;
-  // Continuous raised SE pedestrian sidewalk + alternating yellow-black curbstones
-  addBox(southBlvdGrp, 48.0, 0.16, 3.2, -2.0, 0.08, 9.6, matSidewalkConc, false);
-  for (let cx = -25.0; cx <= 21.0; cx += 1.0) {
-    addBox(
-      southBlvdGrp,
-      0.92,
-      0.2,
-      0.22,
-      cx,
-      0.1,
-      8.0,
-      Math.abs(Math.round(cx)) % 2 === 0 ? matManilaYellow : matDarkSteel,
-      false,
-    );
-  }
-  // Neighborhood commercial row facing Maui Oasis & El Pueblo Boulevard (z = +11.6..+15.6 in local boulevard space)
-  const addBlvdStall = (
-    lx: number,
-    w: number,
-    wallMat: THREE.Material,
-    awningMat: THREE.Material,
-    title: string,
-    sub: string,
-    signBg: string,
-    kind: 'water' | 'carinderia' | 'vulcanizing',
-  ) => {
-    addBox(southBlvdGrp, w, 3.6, 4.2, lx, 1.8, 13.4, wallMat);
-    addBox(southBlvdGrp, w + 0.2, 0.14, 2.2, lx, 2.85, 10.6, awningMat, false);
-    addBox(southBlvdGrp, 0.07, 2.8, 0.07, lx - w / 2 + 0.18, 1.4, 9.65, matDarkSteel, false);
-    addBox(southBlvdGrp, 0.07, 2.8, 0.07, lx + w / 2 - 0.18, 1.4, 9.65, matDarkSteel, false);
-    addSignMesh(southBlvdGrp, w - 0.4, 0.72, lx, 3.25, 11.24, Math.PI, title, sub, {
-      bg: signBg,
-      border: '#ffffff',
-      titleColor: '#ffffff',
-      subtitleColor: '#f5ebb8',
-    });
-    if (kind === 'water') {
-      // Stacked blue 5-gallon purified water jugs + stainless dispenser counter
-      addBox(southBlvdGrp, w - 0.8, 1.0, 0.65, lx, 0.5, 11.1, matSilverSteel, false);
-      for (const jx of [-1.4, -0.95, -0.5, 0.9, 1.35]) {
-        const jug = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.15, 0.15, 0.44, 8)), matWaterBlue);
-        jug.position.set(lx + jx, 0.36, 10.4);
-        southBlvdGrp.add(jug);
-      }
-    } else if (kind === 'carinderia') {
-      // Glass food display warmer + red monobloc stools + red/white Aice freezer
-      addBox(southBlvdGrp, 2.4, 0.95, 0.72, lx - 0.8, 0.55, 10.9, matBrightWhite, false);
-      addBox(southBlvdGrp, 2.2, 0.48, 0.62, lx - 0.8, 1.24, 10.9, matGlass, false);
-      for (const sx of [-1.6, -0.8, 0.0]) {
-        addBox(southBlvdGrp, 0.36, 0.44, 0.36, lx + sx, 0.28, 10.1, matAlfamartRed, false);
-      }
-      addBox(southBlvdGrp, 1.1, 0.82, 0.68, lx + 1.6, 0.48, 10.8, matBrightWhite, false);
-      addBox(southBlvdGrp, 1.12, 0.24, 0.7, lx + 1.6, 0.72, 10.8, matAlfamartRed, false);
-    } else {
-      // Corrugated steel roll-up shutter + stacked rubber tires
-      addBox(southBlvdGrp, w - 0.8, 2.35, 0.12, lx, 1.25, 11.28, matSilverSteel, false);
-      for (let ty = 0; ty < 3; ty++) {
-        const tire = new THREE.Mesh(trackGeo(new THREE.TorusGeometry(0.28, 0.1, 6, 12)), matDarkSteel);
-        tire.rotation.x = Math.PI / 2;
-        tire.position.set(lx - 1.5, 0.22 + ty * 0.2, 10.45);
-        southBlvdGrp.add(tire);
-      }
-    }
-  };
-  addBlvdStall(12.5, 6.4, matBrightWhite, matBrgy630Blue, '630 WATER & LAUNDRY', 'PURIFIED WATER · WASH & FOLD', '#1560a8', 'water');
-  addBlvdStall(5.2, 6.8, matCreamWall, matAlfamartRed, 'TAPSILOGAN & CARINDERIA', 'SILOG MEALS · SARI-SARI · AICE', '#b51e22', 'carinderia');
-  addBlvdStall(-2.2, 6.4, matCondoCream, matCondoBalconyGreen, 'MOTO-FIX & HARDWARE', 'VULCANIZING · MOTOR PARTS', '#22593a', 'vulcanizing');
-
-  // Two parked compact sedans neatly parked along the SE boulevard lay-by
-  for (const [cx, matCar] of [
-    [15.5, matSedanSilver],
-    [-9.5, matSedanMaroon],
-  ] as Array<[number, THREE.Material]>) {
-    const car = new THREE.Group();
-    car.position.set(cx, 0, 6.4);
-    addBox(car, 4.1, 0.72, 1.72, 0, 0.56, 0, matCar);
-    addBox(car, 2.2, 0.58, 1.52, -0.15, 1.18, 0, matCar);
-    addBox(car, 2.05, 0.44, 1.56, -0.15, 1.18, 0, matGlass, false);
-    for (const [wx, wz] of [[-1.25, -0.86], [1.25, -0.86], [-1.25, 0.86], [1.25, 0.86]]) {
-      const cw = new THREE.Mesh(wheelGeo, matDarkSteel);
-      cw.rotation.x = Math.PI / 2;
-      cw.position.set(wx, 0.25, wz);
-      car.add(cw);
-    }
-    southBlvdGrp.add(car);
-  }
-  mauiPathGroup.add(southBlvdGrp);
-
-  // 4. ICONIC WEATHERED MOSS-STREAKED VINE-DRAPED CONCRETE WALL WITH MAUI OASIS MAIN ENTRANCE GATEHOUSE BAY!
-  const vineWallGrp = new THREE.Group();
-  vineWallGrp.position.set(62.5, 0, 95.8);
-  vineWallGrp.rotation.y = MAUI_CORRIDOR_CONFIG.boulevardAngleRad;
-  // Split vine wall cleanly into West Wing (-22..-2.5) and East Wing (+7.5..+22) framing the Maui Oasis Main Gate Bay (local x = -2.5..+7.5)!
-  for (const [segCenter, segLen] of [
-    [-12.25, 19.5],
-    [14.75, 14.5],
-  ] as Array<[number, number]>) {
-    addBox(vineWallGrp, segLen, 2.35, 0.42, segCenter, 1.175, 0, matWeatheredMossWall, true);
-    addBox(vineWallGrp, segLen + 0.15, 0.18, 0.54, segCenter, 2.4, 0, matRawConcrete, false);
-    addBox(vineWallGrp, segLen + 0.15, 0.28, 0.58, segCenter, 0.14, 0, matSidewalkConc, false);
-  }
-  // Concrete wall piers & cascading lush creeping tropical vines draped down from top coping!
-  for (let wx = -20.5; wx <= 20.5; wx += 4.1) {
-    if (wx > -3.2 && wx < 8.0) continue; // Keep Maui Oasis Main Gate driveway open!
-    addBox(vineWallGrp, 0.42, 2.52, 0.56, wx, 1.26, 0, matRawConcrete, false);
-    addBox(vineWallGrp, 2.4, 0.52, 0.72, wx + 1.2, 2.42, 0.12, matVineLush, false);
-    addBox(vineWallGrp, 1.35, 0.85, 0.28, wx + 0.7, 1.96, 0.26, matVineBright, false);
-    if (Math.round(wx) % 2 === 0) {
-      const wtTrunk = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.18, 0.24, 4.4, 7)), matTreeTrunk);
-      wtTrunk.position.set(wx + 0.5, 2.2, -1.35);
-      vineWallGrp.add(wtTrunk);
-      const wtCrown = new THREE.Mesh(trackGeo(new THREE.DodecahedronGeometry(2.5, 0)), matTreeFoliage);
-      wtCrown.scale.set(1.3, 0.82, 1.2);
-      wtCrown.position.set(wx + 0.5, 5.1, -0.6);
-      vineWallGrp.add(wtCrown);
-    }
-  }
-
-  // HAWAIIAN STONE-CLAD MAUI OASIS BY FILINVEST MAIN ENTRANCE ARCHWAY, GUARDHOUSE & BOOM BARRIER (local x = +2.5)!
-  const mauiGate = new THREE.Group();
-  mauiGate.position.set(2.5, 0, 0);
-  // Stone-clad Hawaiian gate columns + overhanging dark-brown hipped gatehouse roof
-  for (const gx of [-4.6, 4.6]) {
-    addBox(mauiGate, 1.25, 1.5, 1.25, gx, 0.75, 0, matCondoStone);
-    addBox(mauiGate, 1.05, 2.6, 1.05, gx, 2.75, 0, matCondoCream);
-    addBox(mauiGate, 1.38, 0.24, 1.38, gx, 4.12, 0, matCondoRoof, false);
-    // Flanking tropical planter beds & palms
-    addBox(mauiGate, 1.8, 0.45, 1.4, gx + (gx < 0 ? -1.4 : 1.4), 0.225, 0.4, matCondoStone, false);
-    addBox(mauiGate, 1.5, 0.55, 1.1, gx + (gx < 0 ? -1.4 : 1.4), 0.65, 0.4, matVineLush, false);
-  }
-  // Overhead Maui Oasis entrance fascia beam + tropical hipped canopy
-  addBox(mauiGate, 10.6, 0.85, 1.2, 0, 4.45, 0, matCondoCream);
-  addBox(mauiGate, 11.2, 0.35, 2.2, 0, 5.0, 0, matCondoRoof, false);
-  addSignMesh(mauiGate, 7.2, 0.82, 0, 4.46, 0.64, 0, 'MAUI OASIS BY FILINVEST', 'MAIN ENTRANCE · 630 ANONAS ST.', {
-    bg: '#2b4d38',
-    border: '#e5c16c',
-    titleColor: '#fff9eb',
-    subtitleColor: '#e5d4a6',
-  });
-  // Center Hawaiian security guardhouse booth + motorized boom barrier
-  addBox(mauiGate, 1.85, 1.2, 1.85, 0, 0.6, -1.1, matCondoStone);
-  addBox(mauiGate, 1.78, 1.15, 1.78, 0, 1.76, -1.1, matGlass, false);
-  addBox(mauiGate, 2.45, 0.22, 2.45, 0, 2.44, -1.1, matCondoRoof, false);
-  addBox(mauiGate, 3.2, 0.09, 0.09, 2.4, 0.96, -0.4, matAlfamartRed, false);
-  addBox(mauiGate, 3.2, 0.09, 0.09, -2.4, 0.96, -0.4, matBrightWhite, false);
-  vineWallGrp.add(mauiGate);
-
-  // Exact May 2026 red-and-white "PRIVATE PROPERTY / NO PARKING / CLAMPING & TOW AWAY ZONE" wall sign
-  addSignMesh(vineWallGrp, 2.1, 1.45, 12.2, 1.45, 0.24, 0, 'PRIVATE PROPERTY', 'NO PARKING · CLAMPING & TOW AWAY ZONE', {
-    bg: '#f7f4ee',
-    border: '#c9231f',
-    titleColor: '#1d4487',
-    subtitleColor: '#c9231f',
-    width: 448,
-    height: 300,
-  });
-  addSignMesh(vineWallGrp, 2.8, 1.0, 18.2, 1.55, 0.24, 0, 'MAUI OASIS · EL PUEBLO', 'ANONAS STREET · BRGY. 630', {
-    bg: '#1c4230',
-    border: '#e5a91a',
-    titleColor: '#ffffff',
-    subtitleColor: '#f2ca68',
-    width: 512,
-    height: 200,
-  });
-  mauiPathGroup.add(vineWallGrp);
-  // Colliders approximating the split vine wall wings along Maui Oasis road
-  addCollider('maui-vine-wall-e', 76.2, 92.2, 14.0, 1.4);
-  addCollider('maui-vine-wall-w', 51.0, 98.8, 18.0, 1.4);
-
-  // 5. PHOTO-MATCHED MAUI OASIS BY FILINVEST (Hawaiian cream stucco mid-rises + Central Resort Swimming Pool & Clubhouse!)
-  const buildMauiOasisWing = (cx: number, cz: number, w: number, h: number, d: number, label?: string) => {
-    addBox(mauiPathGroup, w, h, d, cx, h / 2, cz, matCondoCream, true);
-    addBox(mauiPathGroup, w + 0.25, 2.8, d + 0.25, cx, 1.4, cz, matCondoStone, false);
-    addBox(mauiPathGroup, w + 1.6, 0.45, d + 1.6, cx, h + 0.22, cz, matCondoRoof, false);
-    const hipRoof = new THREE.Mesh(trackGeo(new THREE.ConeGeometry(Math.max(w, d) * 0.62, 3.6, 4)), matCondoRoof);
-    hipRoof.rotation.y = Math.PI / 4;
-    hipRoof.scale.set(w / Math.max(w, d), 1, d / Math.max(w, d));
-    hipRoof.position.set(cx, h + 2.15, cz);
-    mauiPathGroup.add(hipRoof);
-    for (let fy = 4.2; fy < h - 1.2; fy += 3.2) {
-      addBox(mauiPathGroup, w + 0.22, 0.32, d + 0.22, cx, fy, cz, matCondoCream, false);
-      addBox(mauiPathGroup, w * 0.84, 1.15, d + 0.16, cx, fy + 1.25, cz, matGlass, false);
-      addBox(mauiPathGroup, w * 0.88, 0.88, d + 0.28, cx, fy + 0.56, cz, matCondoBalconyGreen, false);
-    }
-    if (label) {
-      addSignMesh(mauiPathGroup, 7.6, 1.35, cx, 3.55, cz + d / 2 + 0.24, 0, label, 'FILINVEST · ANONAS ST., STA. MESA', {
-        bg: '#2b4d38',
-        border: '#e5c16c',
-        titleColor: '#fff9eb',
-        subtitleColor: '#e5d4a6',
-      });
-    }
-  };
-  buildMauiOasisWing(58.0, 86.2, 20.5, 16.5, 11.4, 'MAUI OASIS BY FILINVEST');
-  buildMauiOasisWing(29.0, 87.0, 16.8, 15.2, 11.4);
-  // Central Maui Oasis Resort Swimming Pool & Clubhouse Deck visible between the Hawaiian wings!
-  addBox(mauiPathGroup, 9.8, 0.18, 9.2, 43.2, 0.09, 86.6, matCondoCream, false);
-  addBox(mauiPathGroup, 6.4, 0.14, 5.2, 43.2, 0.14, 86.6, matMauiPoolWater, false);
-  for (const ux of [40.2, 46.2]) {
-    addBox(mauiPathGroup, 0.06, 2.2, 0.06, ux, 1.1, 89.2, matWood, false);
-    const poolUmb = new THREE.Mesh(trackGeo(new THREE.ConeGeometry(1.15, 0.45, 8)), matBrightWhite);
-    poolUmb.position.set(ux, 2.25, 89.2);
-    mauiPathGroup.add(poolUmb);
-  }
-  addCollider('maui-oasis-bldg-main', 58.0, 86.2, 21.2, 11.8);
-  addCollider('maui-oasis-bldg-west', 29.0, 87.0, 17.4, 11.8);
-
-  // 6. PHOTO-MATCHED FUTURA CENTRO BY FILINVEST + EL PUEBLO TRIANGLE CONDOMINIUM (South-East Skyline!)
-  const fcX = 103.0;
-  const fcZ = 104.0;
-  addBox(mauiPathGroup, 19.0, 32.0, 20.0, fcX, 16.0, fcZ, matFuturaGray, false);
-  addBox(mauiPathGroup, 19.8, 1.0, 20.8, fcX, 32.5, fcZ, matFuturaBlueGray, false);
-  for (const dz of [-7.0, 0, 7.0]) {
-    addBox(mauiPathGroup, 19.64, 31.8, 1.6, fcX, 15.9, fcZ + dz, matFuturaBlueGray, false);
-  }
-  for (let fy = 4.0; fy < 30.5; fy += 3.2) {
-    addBox(mauiPathGroup, 19.44, 0.36, 20.44, fcX, fy, fcZ, matBrightWhite, false);
-    addBox(mauiPathGroup, 19.28, 1.25, 17.2, fcX, fy + 1.2, fcZ, matGlass, false);
-  }
-  addSignMesh(mauiPathGroup, 9.0, 1.5, fcX - 9.86, 4.4, fcZ, -Math.PI / 2, 'FUTURA CENTRO', 'BY FILINVEST · STA. MESA', {
-    bg: '#234266',
-    border: '#d6e3f0',
-    titleColor: '#ffffff',
-    subtitleColor: '#a8cbe8',
-  });
-  addCollider('futura-centro-tower', fcX, fcZ, 19.6, 20.6);
-
-  // El Pueblo Triangle Condominium (modern angled white & terracotta tower along the SE curve)
-  const triX = 78.0;
-  const triZ = 126.0;
-  const triGrp = new THREE.Group();
-  triGrp.position.set(triX, 0, triZ);
-  triGrp.rotation.y = 0.26;
-  addBox(triGrp, 18.0, 28.0, 14.0, 0, 14.0, 0, matBrightWhite, false);
-  // Crisp non-coplanar terracotta front accent cladding protruding 0.30m proud of white core (zero Z-fighting)
-  addBox(triGrp, 18.5, 28.0, 2.8, 0, 14.0, -5.9, matCondoTerra, false);
-  addBox(triGrp, 18.8, 0.9, 15.2, 0, 28.45, 0, matCondoRoof, false);
-  for (let fy = 4.0; fy < 26.5; fy += 3.2) {
-    addBox(triGrp, 18.7, 0.32, 15.04, 0, fy, 0, matCondoCream, false);
-    addBox(triGrp, 15.6, 1.15, 14.88, 0, fy + 1.15, 0, matGlass, false);
-  }
-  addSignMesh(triGrp, 7.4, 1.1, 0, 4.4, -7.62, Math.PI, 'EL PUEBLO TRIANGLE', '8010 ANONAS ST. · CONDOMINIUM', {
-    bg: '#8a3524',
-    border: '#f2ca68',
-    titleColor: '#ffffff',
-    subtitleColor: '#f7d996',
-  });
-  mauiPathGroup.add(triGrp);
-
-  // 7. PHOTO-MATCHED EL PUEBLO MANILA CONDOMINIUM, ARCHED GATEHOUSE & COMMERCIAL GROUND FLOOR (630 Anonas St!)
-  const epX = 30.0;
-  const epZ = 116.0;
-  addBox(mauiPathGroup, 3.4, 3.5, 3.4, 41.8, 1.75, 106.5, matBrightWhite, false);
-  addBox(mauiPathGroup, 4.1, 0.45, 4.1, 41.8, 3.65, 106.5, matCondoRoof, false);
-  addBox(mauiPathGroup, 0.35, 1.35, 1.8, 43.55, 1.9, 106.5, matGlass, false);
-  // Motorized boom barrier + pedestrian guard rail at El Pueblo Gatehouse
-  addBox(mauiPathGroup, 0.22, 0.95, 0.22, 43.5, 0.48, 104.2, matAlfamartRed, false);
-  addBox(mauiPathGroup, 0.08, 0.08, 3.4, 43.5, 0.92, 102.4, matBrightWhite, false);
-  addSignMesh(mauiPathGroup, 4.8, 1.15, 43.6, 3.1, 106.5, Math.PI / 2, 'EL PUEBLO MANILA', '630 ANONAS ST. CONDOMINIUM', {
-    bg: '#8a3524',
-    border: '#f2ca68',
-    titleColor: '#ffffff',
-    subtitleColor: '#f7d996',
-  });
-  // Warm terracotta / salmon-ochre twin residential towers + lively ground-floor commercial storefronts
-  addBox(mauiPathGroup, 24.0, 34.0, 14.0, epX, 17.0, epZ, matCondoTerra, false);
-  addBox(mauiPathGroup, 24.8, 0.9, 14.8, epX, 34.45, epZ, matCondoRoof, false);
-  // Ground-floor commercial strip facing the boulevard (7-Eleven / Coffee / Laundry)
-  addBox(mauiPathGroup, 22.0, 3.4, 0.6, epX, 1.7, epZ - 7.18, matBrightWhite, false);
-  addBox(mauiPathGroup, 18.0, 2.2, 0.24, epX, 1.45, epZ - 7.52, matGlass, false);
-  addSignMesh(mauiPathGroup, 10.5, 0.85, epX, 3.35, epZ - 7.66, Math.PI, 'EL PUEBLO COMMERCIAL', 'CONVENIENCE · COFFEE · LAUNDRY · WATER', {
-    bg: '#1c4230',
-    border: '#f2ca68',
-    titleColor: '#ffffff',
-    subtitleColor: '#f2ca68',
-  });
-  for (let fy = 4.6; fy < 32.0; fy += 3.6) {
-    addBox(mauiPathGroup, 24.54, 0.42, 14.54, epX, fy, epZ, matCondoCream, false);
-    addBox(mauiPathGroup, 21.0, 1.25, 14.34, epX, fy + 1.35, epZ, matGlass, false);
-  }
-  addCollider('el-pueblo-condo', epX, epZ, 24.8, 15.0);
-
-  // Subtle street signpost at PUP Main Gate South corner pointing down Anonas St toward Barangay 630, Maui Oasis & El Pueblo
-  const dirPole = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.05, 0.06, 3.2, 6)), matSilverSteel);
-  dirPole.position.set(84.8, 1.6, 27.6);
-  mauiPathGroup.add(dirPole);
-  addSignMesh(mauiPathGroup, 2.4, 0.78, 84.8, 2.95, 27.6, Math.PI / 2, 'ANONAS ST. SOUTH →', 'BRGY. 630 HALL · MAUI OASIS · EL PUEBLO', {
-    bg: '#165a3c',
-    border: '#ffffff',
-    titleColor: '#ffffff',
-    subtitleColor: '#e4f2ea',
-    width: 540,
-    height: 170,
   });
 
-  // Distant Manila urban skyline blocks across the Pasig River (West), East beyond Old Sta. Mesa, & North horizon
+  // Distant Manila urban skyline blocks East beyond Old Sta. Mesa & North horizon
+  // (Western Pasig River view now showcases the realistic Pandacan riverbank & Mabini Bridge above!)
   const skylineMat = trackMat(new THREE.MeshStandardMaterial({ color: 0x8f969e, roughness: 0.9, metalness: 0.04 }));
   const skylineWarmMat = trackMat(new THREE.MeshStandardMaterial({ color: 0xa89f92, roughness: 0.9, metalness: 0.04 }));
   const skylineBlocks: Array<[number, number, number, number, number]> = [
-    [-222, -98, 22, 28, 20],
-    [-230, -52, 26, 44, 22],
-    [-218, -8, 22, 26, 24],
-    [-232, 36, 28, 48, 24],
-    [-222, 84, 24, 32, 26],
     [254, -68, 24, 28, 22],
     [258, -8, 24, 34, 24],
     [254, 46, 26, 32, 24],
     [-20, -124, 34, 26, 22],
     [38, -126, 30, 24, 22],
-    [-12, 124, 32, 28, 22],
   ];
   skylineBlocks.forEach(([sx, sz, sw, sh, sd], i) => {
     addBox(root, sw, sh, sd, sx, sh / 2, sz, i % 2 === 0 ? skylineMat : skylineWarmMat, false);
@@ -3121,6 +2654,8 @@ export function buildPupCampusWorld(
     gateGroup.add(stripe);
   });
   buildSlidingSteelGate(-10.85, 2.3, 74.38);
+  addCollider('main-gate-slide-s', 74.35, 0.95, 0.45, 3.2);
+  addCollider('main-gate-slide-n', 74.38, -10.85, 0.45, 2.4);
 
   // --- 2B. SOUTH FORECOURT WING: FLARED "THE MURAL" WALL + RECESSED COVERED "EXIT" WALKWAY (isv_south_curve.png!) ---
   // Projects forward along the South side of the 12m entrance forecourt, angled slightly outward toward Anonas St!
@@ -3220,7 +2755,8 @@ export function buildPupCampusWorld(
   for (const sz of [-3.65, -3.28, -2.9]) {
     addBox(muralWall, 0.26, 0.95, 0.16, 0.78, 2.05, sz, matOxidizedBronze, false);
   }
-  addCollider('pup-mural-wall', 78.8, 6.2, 7.6, 2.4);
+  // Exact rotated OBB matching flared South EXIT & Mural Corridor (muralCorridor.rotation.y = Math.PI / 2 - 0.16)
+  addOBBCollider('pup-mural-wall', 78.6, 5.4, 3.85, 9.1, Math.PI / 2 - 0.16);
 
   // --- 2B-2. "DAMBANA NG KABAYANIHAN" MONUMENT WALL, "DAMBANANG MABINI SA PUP" PLAQUE & SIDE GATE (z = 9.2..27.2 along South Anonas St!) ---
   const dambanaGrp = new THREE.Group();
@@ -3320,6 +2856,8 @@ export function buildPupCampusWorld(
     height: 350,
   });
   addBox(northEntrance, 0.65, 0.95, 1.05, 73.1, 0.48, -12.3, matWood, false);
+  addCollider('north-entrance-curb-pillar', 79.45, -9.95, 0.65, 0.65);
+  addCollider('north-entrance-brick-pier', 73.6, -13.0, 0.78, 0.78);
 
   // --- 2D. FORWARD-PROJECTING PUP PYLON (3-TIER STEPPED TRAVERTINE/TERRACOTTA PODIUM + MATCHED R=6.6M CURVED FENCE) ---
   const pylonGroup = new THREE.Group();
@@ -3406,7 +2944,7 @@ export function buildPupCampusWorld(
     pylonGroup.add(slab);
   }
   gateGroup.add(pylonGroup);
-  addCollider('pup-pylon', 78.4, -17.3, 5.2, 8.4);
+  addOBBCollider('pup-pylon', 78.4, -17.3, 5.3, 8.5, 0.22);
 
   // CURVED RED-PLINTH + GALVANIZED STEEL-PICKET PYLON FENCE aligned smoothly to R = 6.6m North Forecourt inner sidewalk edge!
   const addFencePostAndPlinth = (fx: number, fz: number, segLen: number, rotY: number) => {
@@ -3435,6 +2973,10 @@ export function buildPupCampusWorld(
   }
   // 3) Straight North-South fence along Anonas St in front of Pylon (x = 83.25, z = -16.4..-23.8)
   addFencePostAndPlinth(83.25, -20.1, 7.4, Math.PI / 2);
+  // Solid colliders along the Pylon perimeter picket fence (straight E-W + curved corner + N-S along Anonas)
+  addCollider('pylon-fence-ew', 77.0, -12.95, 5.8, 0.65);
+  addOBBCollider('pylon-fence-corner', 82.2, -14.0, 3.6, 0.7, -Math.PI / 4);
+  addCollider('pylon-fence-ns', 83.25, -20.1, 0.7, 7.6);
 
   // Iconic Cobalt-Blue Industrial Water-Main Pipe Manifold behind Pylon Anonas fence
   const matWaterPipeBlue = trackMat(new THREE.MeshStandardMaterial({ color: 0x1a56b8, roughness: 0.38, metalness: 0.55 }));
@@ -3754,6 +3296,7 @@ export function buildPupCampusWorld(
     addBox(moto, 0.58, 0.06, 0.08, 0, 0.98, 0.48, matGalvSteel, false);
     addBox(moto, 0.34, 0.28, 0.34, 0, 0.96, -0.58, matDarkSteel, false);
     gateGroup.add(moto);
+    addOBBCollider(`parked-scooter-${++autoColliderIdx}`, mx, mz, 0.62, 1.48, rotY);
   };
   addParkedScooter(68.8, -3.5, -0.25, matTrafficRed);
   addParkedScooter(65.0, 0.6, 0.4, matDarkSteel);
@@ -3890,6 +3433,8 @@ export function buildPupCampusWorld(
   build3DLetter(-1.25, 'P');
   build3DLetter(-0.05, 'U');
   build3DLetter(1.12, 'P');
+  addCollider('pup-charter-wall', 61.4, -13.65, 6.4, 0.58);
+  addCollider('pup-3d-sign-base', 67.2, 4.8, 4.4, 1.3);
 
   // =========================================================================
   // AUTHENTIC PUP STA. MESA RIBBED CREAM-AND-MAROON PERIMETER WALLS
@@ -3971,6 +3516,8 @@ export function buildPupCampusWorld(
   addPupRibbedWallSegment(gateGroup, 82.6, 62.5, 82.6, 78.5, 'pup-wall-anonas-oval-s');
   // South Campus Boundary Wall separating PUP's South Academic Strip (FMO / Food & Nutrition / Gabriela Silang / Tahanan ng Atleta) from Maui Oasis!
   addPupRibbedWallSegment(gateGroup, -54.0, 76.5, 82.0, 76.5, 'pup-south-perimeter-wall');
+  // North Campus Perimeter Wall closing the northern edge behind PSMO, NFTRDC, Swimming Pool & Gymnasium
+  addPupRibbedWallSegment(gateGroup, -58.0, -73.0, 82.6, -73.0, 'pup-north-perimeter-wall');
 
   // =========================================================================
   // 3. TWIN PARALLEL PUP CATWALKS (Both North & South Sides of Main Avenue!)
@@ -3992,6 +3539,7 @@ export function buildPupCampusWorld(
         post.position.set(cx, 1.72, sideZ + dz);
         post.castShadow = castShadow;
         catwalkGroup.add(post);
+        addCollider(`catwalk-post-${sideZ > 0 ? 's' : 'n'}-${Math.round(cx)}-${dz > 0 ? 'e' : 'w'}`, cx, sideZ + dz, 0.42, 0.42);
       }
       addBox(catwalkGroup, 0.12, 0.14, 3.3, cx, 3.02, sideZ, matBrightWhite, false);
     }
@@ -4441,6 +3989,7 @@ export function buildPupCampusWorld(
     const colHigh = new THREE.Mesh(trackGeo(new THREE.CylinderGeometry(0.45, 0.46, 2.2, 14)), matCreamWall);
     colHigh.position.set(px, 2.9, pz);
     mainBldg.add(colLow, colHigh);
+    addCollider(`dome-rotunda-col-${a}`, px, pz, 1.0, 1.0);
   }
   // Row of silver steel gang-chairs inside the Dome Rotunda (exact detail from dome.png!)
   addBox(mainBldg, 5.2, 0.95, 0.22, domeCenter.x - 5.8, 0.48, domeCenter.z + 2.2, matMaroon, false);
@@ -4448,6 +3997,7 @@ export function buildPupCampusWorld(
     addBox(mainBldg, 0.56, 0.52, 0.08, domeCenter.x - 7.8 + s * 0.8, 0.78, domeCenter.z + 1.9, matSilverSteel, false);
     addBox(mainBldg, 0.56, 0.08, 0.46, domeCenter.x - 7.8 + s * 0.8, 0.48, domeCenter.z + 1.68, matSilverSteel, false);
   }
+  addCollider('dome-gang-chairs', domeCenter.x - 5.8, domeCenter.z + 1.9, 5.3, 0.95);
 
   // Ma'am Clara's Reception Desk inside Central Rotunda
   addBox(mainBldg, 4.4, 1.08, 1.15, domeCenter.x, 0.54, domeCenter.z + 5.2, matMaroon);
@@ -4520,6 +4070,7 @@ export function buildPupCampusWorld(
       const dz = 38.5 + row * 2.2;
       addBox(mainBldg, 1.1, 0.08, 0.62, dx, 0.74, dz, matWood, false);
       addBox(mainBldg, 0.95, 0.72, 0.48, dx, 0.36, dz, matDarkSteel, false);
+      addCollider(`e104-desk-${row}-${col}`, dx, dz, 1.15, 0.72);
     }
   }
   addSignMesh(mainBldg, 2.4, 0.55, domeCenter.x + 2.4, 3.0, 37.0, Math.PI, 'ROOM E-104', 'EAST WING LECTURE HALL');
@@ -4543,20 +4094,37 @@ export function buildPupCampusWorld(
   // --- WING 2: WEST WING (radiating cleanly NW at -0.78*PI from Dome — zero overlap with South Wing or Lagoon!) ---
   const westWing = buildPupWing(mainBldg, 22, 10.8, true, true);
   westWing.position.set(domeCenter.x, 0, domeCenter.z);
-  westWing.rotation.y = -Math.PI * 0.78;
-  addCollider('west-wing-col-1', -38, 13, 10, 10);
-  addCollider('west-wing-col-2', -44, 6, 10, 10);
+  const westRot = -Math.PI * 0.78;
+  westWing.rotation.y = westRot;
+  // Exact rotated OBB covering entire West Wing from Rotunda perimeter outward (local z = 7.5..23.5)
+  addOBBCollider(
+    'main-west-wing',
+    domeCenter.x + Math.sin(westRot) * 15.5,
+    domeCenter.z + Math.cos(westRot) * 15.5,
+    11.4,
+    16.2,
+    westRot,
+  );
 
   // --- WING 3: SOUTH WING (radiating cleanly WSW at -0.48*PI with iconic TEAL-GREEN roof courtyard from main_dome.jpg!) ---
   const southWing = buildPupWing(mainBldg, 20, 10.2, true, false, 'teal-south');
   southWing.position.set(domeCenter.x, 0, domeCenter.z);
-  southWing.rotation.y = -Math.PI * 0.48;
+  const southRot = -Math.PI * 0.48;
+  southWing.rotation.y = southRot;
   // Parallel rear teal-roofed South courtyard block (clean 9m courtyard gap from East Wing!)
   const southCross = buildPupWing(mainBldg, 18, 7.2, true, false, 'teal-south');
   southCross.position.set(domeCenter.x - 19, 0, domeCenter.z + 2.5);
   southCross.rotation.y = 0;
-  addCollider('south-wing-col-1', -41, 25, 11, 11);
-  addCollider('south-wing-col-2', -47, 36, 9, 17);
+  // Exact rotated OBB covering South Wing (local z = 7.5..21.2) + South Courtyard Cross Wing
+  addOBBCollider(
+    'main-south-wing',
+    domeCenter.x + Math.sin(southRot) * 14.3,
+    domeCenter.z + Math.cos(southRot) * 14.3,
+    10.8,
+    14.0,
+    southRot,
+  );
+  addCollider('main-south-cross', domeCenter.x - 19, domeCenter.z + 2.5 + 9.0, 7.8, 18.6);
 
   // =========================================================================
   // 7. NEW 9-STOREY NORTH WING — ACTIVE DPWH CONSTRUCTION SITE (x = -10, z = 13)
@@ -4579,8 +4147,8 @@ export function buildPupCampusWorld(
   addBox(constrGroup, 13.8, 2.4, 0.25, 0, 1.2, 9.2, matHoarding);
   addBox(constrGroup, 0.25, 2.4, 18.4, -6.9, 1.2, 0, matHoarding);
   addBox(constrGroup, 0.25, 2.4, 18.4, 6.9, 1.2, 0, matHoarding);
-  addCollider('north-wing-site-1', -14.5, 12.5, 13.5, 12.5);
-  addCollider('north-wing-site-2', -8.5, 8.8, 10.5, 10.0);
+  // Exact rotated OBB wrapping the entire corrugated GI construction hoarding enclosure!
+  addOBBCollider('north-wing-site', -12.5, 11.5, 14.1, 18.7, Math.PI * 0.34);
 
   // Unfinished 5-level reinforced concrete skeleton (columns, poured slabs, rusty rebar starter bars)
   const colXs = [-4.4, -1.5, 1.5, 4.4];
@@ -4717,15 +4285,17 @@ export function buildPupCampusWorld(
       const bloomMat = trackMat(new THREE.MeshStandardMaterial({ color: 0xc92a58, roughness: 0.85 }));
       addBox(segGroup, 5.6, 0.24, 0.52, 0, 2.18, -10.25, bloomMat, false);
 
-      // Wall collider matching actual rotated local (0, 0, -9.8) world offset
-      const cx = -2 - Math.sin(segYaw) * 9.8;
-      const cz = 42 - Math.cos(segYaw) * 9.8;
-      addCollider(`chapel-wall-${i}`, cx, cz, 3.6, 3.6);
+      // Exact rotated OBB wall collider sealing all 7 octagonal wall bays & exterior planters completely (zero corner gaps!)
+      const cx = -2 - Math.sin(segYaw) * 10.0;
+      const cz = 42 - Math.cos(segYaw) * 10.0;
+      addOBBCollider(`chapel-wall-${i}`, cx, cz, 8.6, 1.85, segYaw);
     } else {
       // North Entrance Portal Header + Wide Concrete Steps + Silver Handrails (matches chapel.jpg!)
       addBox(segGroup, 8.2, 1.45, 0.8, 0, 4.1, -9.8, matBrightWhite);
       addBox(segGroup, 2.0, 3.5, 0.7, -3.2, 1.75, -9.8, matBrightWhite);
       addBox(segGroup, 2.0, 3.5, 0.7, 3.2, 1.75, -9.8, matBrightWhite);
+      addCollider('chapel-jamb-w', -5.2, 32.2, 2.2, 1.1);
+      addCollider('chapel-jamb-e', 1.2, 32.2, 2.2, 1.1);
       for (let st = 0; st < 4; st++) {
         addBox(segGroup, 5.6, 0.16, 0.45, 0, 0.08 + st * 0.15, -10.2 - (3 - st) * 0.42, matRawConcrete, false);
       }
@@ -4897,6 +4467,8 @@ export function buildPupCampusWorld(
     { bg: '#6e6a62', border: '#c7c1b5', titleColor: '#f5f2eb', subtitleColor: '#e5a91a', width: 512, height: 192 },
   );
   lagoonGroup.add(gateArch);
+  addCollider('lagoon-arch-pier-n', -1.5, -17.5, 2.0, 2.4);
+  addCollider('lagoon-arch-pier-s', -1.5, -10.5, 2.0, 2.4);
 
   // July 2026 Lagoon Arch Octagonal Maroon-Trimmed Center Flower Planter + Maroon Plaza Curbs (lagoon_arch_2026.jpg!)
   const archPlanter = new THREE.Group();
@@ -4910,6 +4482,7 @@ export function buildPupCampusWorld(
   apShrub.position.y = 0.95;
   archPlanter.add(apBase, apCap, apShrub);
   lagoonGroup.add(archPlanter);
+  addCollider('lagoon-arch-planter', -5.8, -14.0, 2.95, 2.95);
   // Maroon concrete walkway border curbs inside the Lagoon plaza (lagoon_arch_2026.jpg & lagoon_1_2026.jpg!)
   addBox(lagoonGroup, 10.5, 0.24, 0.26, -7.2, 0.12, -21.2, matMaroon, false);
   addBox(lagoonGroup, 10.5, 0.24, 0.26, -7.2, 0.12, -6.8, matMaroon, false);
@@ -4997,6 +4570,13 @@ export function buildPupCampusWorld(
   amphiGroup.add(amphiRail);
   addBox(amphiGroup, 4.8, 2.2, 0.35, 0, 1.65, -0.6, matBrightWhite, false);
   lagoonGroup.add(amphiGroup);
+  addCollider('lagoon-amphi-backdrop', -20.5, -4.1, 5.0, 0.85);
+  for (let seg = 0; seg < 5; seg++) {
+    const a = ((seg + 0.5) / 5) * Math.PI;
+    const ax = -20.5 + Math.cos(a) * 5.6;
+    const az = -3.5 + Math.sin(a) * 5.6;
+    addOBBCollider(`lagoon-amphi-tier-${seg}`, ax, az, 3.8, 3.2, a - Math.PI / 2);
+  }
 
   // =========================================================================
   // 10. NINOY AQUINO LIBRARY & LEARNING RESOURCES CENTER — NALLRC (x = -24, z = -44)
@@ -5127,7 +4707,7 @@ export function buildPupCampusWorld(
     addBox(charlieGroup, 0.95, 3.7, 0.55, 7.2, 6.4, fz, matCharlieYellow);
   }
   addBox(charlieGroup, 14.6, 1.15, 22.8, 0, 11.4, 0, matMaroon);
-  addCollider('charlie-hall', -54, -12, 15.5, 23.0);
+  addOBBCollider('charlie-hall', -54, -12, 15.6, 23.2, Math.PI * 0.14);
 
   // Iconic Brick-Red PUP Laboratory High School (#26 — cleanly west of Water Tower & NALLRC, X = [-66.5..-52.5], Z = [-50.5..-25.0]!)
   const matLabRed = trackMat(new THREE.MeshStandardMaterial({ color: 0xa63c2e, roughness: 0.78 }));
@@ -5145,7 +4725,7 @@ export function buildPupCampusWorld(
       addBox(lhsGroup, 10.6, 0.85, 3.42, 1.0, fy, wz, matGlass, false);
     }
   }
-  addCollider('lab-high-school', -59.5, -37.5, 14.0, 25.0);
+  addOBBCollider('lab-high-school', -59.5, -37.5, 14.0, 24.4, Math.PI * 0.08);
 
   // ICONIC PUP OCTAGONAL MUSHROOM WATER TOWER (#29 — cleanly separated NW of NALLRC at (-44, -58.5), >= 3.5m clear on every side!)
   const wtGroup = new THREE.Group();
@@ -5251,7 +4831,11 @@ export function buildPupCampusWorld(
     border: '#e5a91a',
   });
   ovalGroup.add(gsGroup);
-  addCollider('pup-grandstand', 32.1, 32.4, 9.6, 22.0);
+  // Exact rotated OBB matching ovalGroup's -0.16*PI orientation and gsGroup local offset (-19.5, -2.5)
+  const ovalRot = -Math.PI * 0.16;
+  const gsWorldX = 48 + -19.5 * Math.cos(ovalRot) + -2.5 * Math.sin(ovalRot);
+  const gsWorldZ = 44 - -19.5 * Math.sin(ovalRot) + -2.5 * Math.cos(ovalRot);
+  addOBBCollider('pup-grandstand', gsWorldX, gsWorldZ, 9.8, 24.4, ovalRot);
 
   // =========================================================================
   // 13. NORTHEAST SPORTS COMPLEX: COURTS (#4-#6), GYMNASIUM (#38), POOL (#37),
@@ -5523,6 +5107,7 @@ export function buildPupCampusWorld(
       border: '#e5a91a',
     });
     addCollider(`${id}-n`, 82.6, zPos - 3.4, 1.6, 2.4);
+    addCollider(`${id}-leaf-n`, 82.6, zPos - 1.2, 0.55, 2.3);
     addCollider(`${id}-s`, 82.6, zPos + 3.4, 1.6, 2.4);
   };
   buildSideGate('gym-gate', -28.0, 'PUP GYMNASIUM GATE', 'EAST SPORTS ACCESS');
@@ -5623,9 +5208,9 @@ export function buildPupCampusWorld(
   buildPupGazebo('gazebo-east', 17.0, 29.0);
   buildPupGazebo('gazebo-sw', -41.0, 52.0);
 
-  // #18 TAHANAN NG ATLETA (x = 26.0, z = 67.5 — photo-matched to p18_tahanan_atleta.jpg!)
+  // #18 TAHANAN NG ATLETA (positioned cleanly SW of PUP Track & Field Oval at x = 27.5, z = 68.8 — zero overlap with Oval track or South Perimeter Wall!)
   const atletaGroup = new THREE.Group();
-  atletaGroup.position.set(26.0, 0, 67.5);
+  atletaGroup.position.set(27.5, 0, 68.8);
   root.add(atletaGroup);
   addContactShadow(atletaGroup, 0, 0, 17.0, 11.8);
   // Deep maroon rusticated ground floor + warm cream upper 2 floors divided by crisp white pilasters (p18_tahanan_atleta.jpg!)
@@ -5664,7 +5249,7 @@ export function buildPupCampusWorld(
     titleColor: '#7b1718',
     subtitleColor: '#4a1b1b',
   });
-  addCollider('tahanan-ng-atleta', 26.0, 67.5, 15.0, 10.0);
+  addCollider('tahanan-ng-atleta', 27.5, 68.8, 15.0, 10.0);
 
   // #19 GABRIELA SILANG BUILDING (x = 7.0, z = 67.5 — southern heritage academic hall beside Tahanan ng Atleta!)
   const gsBldg = new THREE.Group();
@@ -5942,7 +5527,8 @@ export function buildPupCampusWorld(
     addBox(bg, 2.0, 0.1, 0.52, 0, 0.48, 0.04, matDarkSteel, false);
     addBox(bg, 2.0, 0.44, 0.09, 0, 0.8, -0.22, matDarkSteel, false);
     root.add(bg);
-    benches.push({ id, label, sitPosition: new THREE.Vector3(x, 0, z), sitYaw: rotY });
+    addOBBCollider(`bench-col-${id}`, x, z, 2.1, 0.72, rotY);
+    benches.push({ id, label, sitPosition: new THREE.Vector3(scaleWorldX(x), 0, scaleWorldZ(z)), sitYaw: rotY });
   }
 
   addCampusBench('bench-fp-1', 'Freedom Park Bench', 8, 8, Math.PI * 0.25);
@@ -5954,23 +5540,27 @@ export function buildPupCampusWorld(
   addCampusBench('bench-linear-1', 'Linear Park Pasig River Bench', -67, -2, -Math.PI / 2);
   addCampusBench('bench-linear-2', 'Linear Park Pasig River Bench', -67, 22, -Math.PI / 2);
 
-  // Inspectable Plaques & Notice Boards synced directly with INSPECTABLE_ITEMS
+  // Inspectable Plaques & Notice Boards synced directly with INSPECTABLE_ITEMS (item.position is already scaled to real-world meters!)
   for (const item of INSPECTABLE_ITEMS) {
     inspectables.push({ item, position: new THREE.Vector3(item.position.x, item.position.y, item.position.z) });
+    const bpX = item.position.x / CAMPUS_XZ_SCALE;
+    const bpZ = item.position.z / CAMPUS_XZ_SCALE;
     if (item.kind === 'plaque') {
       const pg = new THREE.Group();
-      pg.position.set(item.position.x, 0, item.position.z);
+      pg.position.set(bpX, 0, bpZ);
       addBox(pg, 0.82, 1.15, 0.42, 0, 0.58, 0, matIntramuros);
       addBox(pg, 0.92, 0.12, 0.56, 0, 1.2, 0, matGold, false);
       root.add(pg);
+      addCollider(`plaque-col-${item.id}`, bpX, bpZ, 0.95, 0.55);
     } else if (item.kind === 'board' && item.id !== 'board-north-wing-dpwh') {
       const brd = new THREE.Group();
-      brd.position.set(item.position.x, 0, item.position.z);
+      brd.position.set(bpX, 0, bpZ);
       addBox(brd, 0.15, 2.2, 0.15, -1.1, 1.1, 0, matDarkSteel, false);
       addBox(brd, 0.15, 2.2, 0.15, 1.1, 1.1, 0, matDarkSteel, false);
       addBox(brd, 2.5, 1.35, 0.16, 0, 1.75, 0, matMaroon);
       addBox(brd, 2.25, 1.12, 0.2, 0, 1.75, 0, matCreamWall, false);
       root.add(brd);
+      addCollider(`board-col-${item.id}`, bpX, bpZ, 2.55, 0.45);
     }
   }
 
@@ -6007,7 +5597,7 @@ export function buildPupCampusWorld(
     lantern.position.set(lx, 5.3, lz);
     root.add(lantern);
     if (hasLight) {
-      const pl = new THREE.PointLight(0xffbe63, 0, 34, 1.55);
+      const pl = new THREE.PointLight(0xffbe63, 0, 50, 1.5);
       pl.position.set(lx, 5.2, lz);
       root.add(pl);
       lampLights.push(pl);
@@ -6074,7 +5664,7 @@ export function buildPupCampusWorld(
   );
   moonHalo.position.copy(moonMesh.position);
   nightSkyGroup.add(moonHalo);
-  root.add(nightSkyGroup);
+  worldRoot.add(nightSkyGroup);
 
   // =========================================================================
   // 15. LUSH MANILA ACACIA / RAIN TREES & MULTI-FROND ROYAL PALMS (InstancedMesh!)
@@ -6093,7 +5683,7 @@ export function buildPupCampusWorld(
     // Around NALLRC, Gym, Oval, Southern Strip & Linear Park (cleanly clear of all new buildings!)
     [-43, -46, 1.15], [-10, -54, 1.15], [6, -54, 1.15],
     [66, 22, 1.2], [68, 46, 1.15], [58, 66, 1.1], [16.5, 58.0, 1.1],
-    [-68, -26, 1.05], [-68, 28, 1.1], [-66, 48, 1.15],
+    [-68, -26, 1.05], [-68, 28, 1.1], [-59.5, 44, 1.05],
   ];
 
   const trunkMat = trackMat(new THREE.MeshStandardMaterial({ color: 0x4b3a2b, roughness: 0.94 }));
@@ -6133,6 +5723,7 @@ export function buildPupCampusWorld(
     dummy.scale.set(sc, sc, sc);
     dummy.updateMatrix();
     trunkInst.setMatrixAt(i, dummy.matrix);
+    addCollider(`acacia-trunk-${i}`, tx, tz, 0.95 * sc, 0.95 * sc);
 
     // Soft ground contact shadow under every Acacia tree
     dummy.position.set(tx, 0.056, tz);
@@ -6262,6 +5853,12 @@ export function buildPupCampusWorld(
     protectedSubtrees.add(d.leftPivot);
     protectedSubtrees.add(d.rightPivot);
   }
+  for (const boat of riverBoats) {
+    protectedSubtrees.add(boat.group);
+  }
+  for (const lily of riverLilies) {
+    protectedSubtrees.add(lily.mesh);
+  }
   const protectedMeshes = new Set<THREE.Object3D>([...animatedFlags, ...waterMeshes]);
 
   const isInsideProtected = (obj: THREE.Object3D): boolean => {
@@ -6361,10 +5958,11 @@ export function buildPupCampusWorld(
       }
     }
   }
-  root.add(mergedStaticGroup);
+  // Attach mergedStaticGroup to unscaled worldRoot because applyMatrix4(m.matrixWorld) already baked root.scale!
+  worldRoot.add(mergedStaticGroup);
 
   return {
-    root,
+    root: worldRoot,
     colliders,
     doors,
     benches,
@@ -6377,6 +5975,8 @@ export function buildPupCampusWorld(
     craneJib,
     waterMeshes,
     waterTimeUniform,
+    riverBoats,
+    riverLilies,
     perfStats: {
       originalStaticMeshes,
       mergedStaticBatches,
